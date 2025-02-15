@@ -45,13 +45,21 @@ import h5py
 import numpy as np
 import time
 
-def pack_or_append_to_h5(sources, output_h5, file_mode):
+def pack_or_append_to_h5(sources,
+                         output_h5,
+                         file_mode,
+                         compression=None,
+                         compression_opts=None,
+                         shuffle=False):
     """
     Archive or append the given sources (directories and/or files) into the HDF5 archive.
 
     :param sources: List of source directories and/or files.
     :param output_h5: The HDF5 archive filename.
     :param file_mode: 'w' to create a new archive (overwrite), or 'a' to append.
+    :param compression: Compression strategy (e.g., 'gzip', 'lzf', etc.).
+    :param compression_opts: Compression options (e.g., level for 'gzip').
+    :param shuffle: Whether to use the shuffle filter.
     """
     output_h5 = os.path.expanduser(output_h5)
     t0 = time.time()
@@ -77,7 +85,9 @@ def pack_or_append_to_h5(sources, output_h5, file_mode):
                 rel_path,
                 data=file_data,
                 dtype=np.uint8,
-                compression=None
+                compression=compression,
+                compression_opts=compression_opts,
+                shuffle=shuffle
             )
 
         # Process each source.
@@ -160,12 +170,21 @@ def main():
     parser.add_argument("-C", "--directory", default=".",
                         help="Target extraction directory (default: current directory).")
 
+    # Compression options.
+    parser.add_argument("-z", "--gzip", action="store_true", help="Use gzip compression.")
+    parser.add_argument("--lzf", action="store_true", help="Use hdf5 lzf compression.")
+    parser.add_argument("--szip", action="store_true", help="Use hdf5 szip compression.")
+    parser.add_argument("--zopt", type=str, default="9", help="Compression level for gzip (default: 9).")
+    # for szip the compression options is a comman separated string of 2 values
+    parser.add_argument("--shuffle", action="store_true", help="Use shuffle filter.")
+
     # Positional argument:
     # For -c and -r: one or more source directories or files.
     # For -x: optionally, the file key to extract (if omitted, extract entire archive).
-    parser.add_argument("path", nargs="*", default=None,
-                        help=("For -c and -r: source directories/files; "
-                              "for -x: file key to extract (if omitted, extract entire archive)."))
+    parser.add_argument(
+        "path", nargs="*", default=None,
+        help=("For -c and -r: source directories/files; "
+        "for -x: file key to extract (if omitted, extract entire archive)."))
 
     args = parser.parse_args()
 
@@ -173,18 +192,55 @@ def main():
     target_dir = args.directory  # For extraction, the target directory.
     sources = args.path         # For archive/append mode, this is a list of sources.
 
+    # Determine compression settings.
+    compression = None
+    compression_opts = None
+    if args.gzip:
+        compression = 'gzip'
+        if args.zopt:
+            compression_opts = int(args.zopt)
+        else:
+            compression_opts = 4
+    elif args.lzf:
+        compression = 'lzf'
+        if args.zopt:
+            print("Warning: Ignoring compression level for lzf.")
+        else:
+            pass
+    elif args.szip:
+        compression = 'szip'
+        print('warning: szip compression is not tested yet')
+        if args.zopt:
+            compression_opts = tuple(map(int, args.zopt.split(',')))
+        else:
+            compression_opts = (4, 4)
+    else:
+        pass
+
     if args.c:
         # Create archive.
         if not sources:
             print("Error: At least one source (directory or file) is required for archive creation (-c).", file=sys.stderr)
             sys.exit(1)
-        pack_or_append_to_h5(sources, h5_file, 'w')
+        pack_or_append_to_h5(
+            sources,
+            h5_file,
+            'w',
+            compression=compression,
+            compression_opts=compression_opts,
+            shuffle=args.shuffle)
     elif args.r:
         # Append to archive.
         if not sources:
             print("Error: At least one source (directory or file) is required for appending (-r).", file=sys.stderr)
             sys.exit(1)
-        pack_or_append_to_h5(sources, h5_file, 'a')
+        pack_or_append_to_h5(
+            sources,
+            h5_file,
+            'a',
+            compression=compression,
+            compression_opts=compression_opts,
+            shuffle=args.shuffle)
     elif args.x:
         # Extract from archive.
         # If sources is not empty, treat the first source as the file key.
