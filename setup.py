@@ -1,17 +1,18 @@
 from setuptools import setup, find_packages
 
 setup(
-    name='hdf5-archive-utility',
+    name='har',
     version='1.0.0',
-    packages=find_packages(),
+    packages=find_packages(where='src'),
+    package_dir={'': 'src'},
+    include_package_data=True,
     install_requires=[
         'h5py',
         'numpy',
     ],
     entry_points={
         'console_scripts': [
-            'har=h5:main',
-            'h5=h5:main',
+            'har=har:main',
         ],
     },
     author='Your Name',
