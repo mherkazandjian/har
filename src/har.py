@@ -81,7 +81,7 @@ def pack_or_append_to_h5(sources,
             with open(file_path, 'rb') as fobj:
                 file_content = fobj.read()
             file_data = np.frombuffer(file_content, dtype=np.uint8)
-            h5fobj.create_dataset(
+            ds = h5fobj.create_dataset(
                 rel_path,
                 data=file_data,
                 dtype=np.uint8,
@@ -89,16 +89,28 @@ def pack_or_append_to_h5(sources,
                 compression_opts=compression_opts,
                 shuffle=shuffle
             )
+            # Store file permissions as an attribute.
+            ds.attrs['mode'] = os.stat(file_path).st_mode
 
         # Process each source.
         for source in sources:
             source = os.path.expanduser(source)
             if os.path.isdir(source):
+                # Use the parent of the source so the directory name is preserved
+                # in the archive (matching tar behavior).
+                source = os.path.normpath(source)
+                base_dir = os.path.dirname(os.path.abspath(source))
                 # Process the directory recursively.
                 for root, dirs, files in os.walk(source):
                     for fname in files:
                         file_path = os.path.join(root, fname)
-                        process_file(file_path, source)
+                        process_file(file_path, base_dir)
+                    # Store empty directories as groups with a marker attribute.
+                    if not files and not dirs:
+                        rel_dir = os.path.relpath(root, base_dir)
+                        grp = h5fobj.require_group(rel_dir)
+                        grp.attrs['empty_dir'] = True
+                        print(f"Storing empty dir: {rel_dir}")
             elif os.path.isfile(source):
                 process_file(source, None)
             else:
@@ -115,33 +127,58 @@ def extract_h5_to_directory(h5_path, extract_dir, file_key=None):
     """
     h5_path = os.path.expanduser(h5_path)
     extract_dir = os.path.expanduser(extract_dir)
-    with h5py.File(h5_path, 'r') as h5fobj:
+    if not os.path.exists(h5_path):
+        print(f"Error: archive '{h5_path}' not found.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        h5fobj = h5py.File(h5_path, 'r')
+    except OSError as e:
+        print(f"Error: cannot open '{h5_path}': {e}", file=sys.stderr)
+        sys.exit(1)
+    with h5fobj:
         if file_key:
             if file_key not in h5fobj:
                 print(f"Error: '{file_key}' not found in archive.", file=sys.stderr)
                 sys.exit(1)
             dest_file_path = os.path.join(extract_dir, file_key)
             os.makedirs(os.path.dirname(dest_file_path), exist_ok=True)
-            file_bytes = h5fobj[file_key][()].tobytes()
+            dataset = h5fobj[file_key]
+            file_bytes = dataset[()].tobytes()
             with open(dest_file_path, 'wb') as fout:
                 fout.write(file_bytes)
+            if 'mode' in dataset.attrs:
+                os.chmod(dest_file_path, dataset.attrs['mode'])
             print(f"Extracted: {file_key}")
         else:
-            def extract_dataset(name, obj):
+            def extract_item(name, obj):
                 if isinstance(obj, h5py.Dataset):
                     dest_file_path = os.path.join(extract_dir, name)
                     os.makedirs(os.path.dirname(dest_file_path), exist_ok=True)
                     file_bytes = obj[()].tobytes()
                     with open(dest_file_path, 'wb') as fout:
                         fout.write(file_bytes)
+                    if 'mode' in obj.attrs:
+                        os.chmod(dest_file_path, obj.attrs['mode'])
                     print(f"Extracted: {name}")
-            h5fobj.visititems(extract_dataset)
+                elif isinstance(obj, h5py.Group) and obj.attrs.get('empty_dir'):
+                    dest_dir_path = os.path.join(extract_dir, name)
+                    os.makedirs(dest_dir_path, exist_ok=True)
+                    print(f"Created empty dir: {name}")
+            h5fobj.visititems(extract_item)
     print("Extraction complete!")
 
 def list_h5_contents(h5_path):
     """List all dataset keys in the given HDF5 file."""
     h5_path = os.path.expanduser(h5_path)
-    with h5py.File(h5_path, 'r') as h5fobj:
+    if not os.path.exists(h5_path):
+        print(f"Error: archive '{h5_path}' not found.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        h5fobj = h5py.File(h5_path, 'r')
+    except OSError as e:
+        print(f"Error: cannot open '{h5_path}': {e}", file=sys.stderr)
+        sys.exit(1)
+    with h5fobj:
         keys = []
         def visitor(name, obj):
             if isinstance(obj, h5py.Dataset):
