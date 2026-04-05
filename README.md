@@ -1,58 +1,103 @@
-# HDF5 Archive Utility
+# har - HDF5 Archive Utility
 
-## Purpose
+A command-line tool for creating, appending to, extracting from, and listing
+HDF5 archives. Designed as an alternative to `tar` with built-in parallel I/O,
+per-file metadata, and indexed random access.
 
-This script provides a command-line interface for creating, appending to, extracting from, and listing the contents of HDF5 archives.
+## Advantages over tar
 
-The main advantages over tar is the following:
-
-  - ability to dynamically add files and not necessarily just append and concatenate especilly
-    when compression is enabled.
-  - ability to store metadata and attributes for each file.
-  - adds all the functionality of the HDF5 library.
-
-This script performs one of four operations on an HDF5 archive:
-
-- Create archive (-c): Archive one or more directories/files into a new HDF5 file.
-- Append (-r): Append one or more directories/files to an existing HDF5 file.
-  In append mode, sources are processed recursively. Existing entries are skipped.
-- Extract (-x): Extract files from an HDF5 archive.
-  * With no extra positional argument, extracts the entire archive.
-  * With a positional file key, extracts only that dataset.
-  * Optionally specify extraction directory with -C.
-- List (-t): List the contents (dataset keys) of an HDF5 file.
+- **Parallel I/O** — read and write files concurrently with `-p N`
+- **Indexed access** — extract a single file without scanning the entire archive
+- **Dynamic append** — add files to an existing archive without rewriting it
+- **Per-file metadata** — file permissions are stored and restored automatically
+- **Smaller archives** — HDF5 format has less overhead than tar for many small files
+  (35% smaller on 100k files without compression)
+- **Built-in compression** — gzip, lzf, and shuffle filter support
 
 ## Installation
 
 ```sh
-pip install h5ar
+pip install .
 ```
 
-## Usage Examples
+## Usage
+
+### Flag comparison with tar
+
+| Operation              | tar                        | har                        |
+|------------------------|----------------------------|----------------------------|
+| Create archive         | `tar -cf archive.tar dir`  | `har -cf archive.h5 dir`   |
+| Create (verbose)       | `tar -cvf archive.tar dir` | `har -cvf archive.h5 dir`  |
+| Extract archive        | `tar -xf archive.tar`      | `har -xf archive.h5`       |
+| Extract to directory   | `tar -xf archive.tar -C d` | `har -xf archive.h5 -C d`  |
+| Extract single file    | `tar -xf archive.tar path` | `har -xf archive.h5 path`  |
+| List contents          | `tar -tf archive.tar`      | `har -tf archive.h5`       |
+| Append to archive      | `tar -rf archive.tar dir`  | `har -rf archive.h5 dir`   |
+| Gzip compression       | `tar -czf archive.tar.gz`  | `har -czf archive.h5`      |
+
+### har-specific flags (not in tar)
+
+| Flag                | Description                                         |
+|---------------------|-----------------------------------------------------|
+| `-p N, --parallel N`| Number of parallel workers (default: 1 = sequential) |
+| `--lzf`             | Use HDF5 lzf compression (fast, moderate ratio)      |
+| `--szip`            | Use HDF5 szip compression                            |
+| `--zopt LEVEL`      | Gzip compression level 1-9 (default: 9)              |
+| `--shuffle`         | HDF5 shuffle filter before compression               |
+
+### Examples
 
 ```sh
-# Create archive from multiple directories or files:
-har -cf mydir.h5 mydir anotherdir file.txt
-har -czf mydir.h5 mydir anotherdir file.txt
-# gzip compression with level 9 of compression
-har -czf mydir.h5 --zopt 9 mydir anotherdir file.txt
-# use also hdf5 suffle
-har -czf mydir.h5 --zopts 9 --shuffle mydir anotherdir file.txt
+# create an archive from a directory
+har -cf archive.h5 mydir
 
-# Append multiple directories or files to an existing archive:
-har -r -f mydir.h5 mydir anotherdir
+# create with verbose output
+har -cvf archive.h5 mydir
 
-# Extract entire archive to current directory:
-har -x -f mydir.h5
+# create from multiple sources
+har -cf archive.h5 dir1 dir2 file.txt
 
-# Extract entire archive to a specified directory:
-har -x -f mydir.h5 -C foo
+# create with gzip compression (level 9, shuffle filter)
+har -czf archive.h5 --zopt 9 --shuffle mydir
 
-# Extract a specific file (dataset) from the archive:
-har -x -f mydir.h5 path_to_file_in_the_archive
+# create with lzf compression (faster than gzip, less compression)
+har -cf archive.h5 --lzf mydir
 
-# List contents of the archive:
-har -t -f mydir.h5
+# create with parallel reads (8 workers)
+har -cf archive.h5 -p 8 mydir
 
+# append files to an existing archive (skips duplicates)
+har -rf archive.h5 newdir morefile.txt
 
+# list archive contents
+har -tf archive.h5
+
+# extract entire archive to current directory
+har -xf archive.h5
+
+# extract to a specific directory
+har -xf archive.h5 -C /tmp/output
+
+# extract a single file by its path in the archive
+har -xf archive.h5 mydir/subdir/file.txt
+
+# extract with parallel writes (8 workers)
+har -xf archive.h5 -C output -p 8
+
+# combine flags freely (verbose + gzip + parallel)
+har -cvzf archive.h5 -p 16 --shuffle mydir
 ```
+
+## Benchmarks
+
+100,000 small files (29 MB total) on GPFS:
+
+| Operation       | tar     | har -p 1 | har -p 8 | har -p 16 |
+|-----------------|---------|----------|----------|-----------|
+| Create archive  | 99s     | 244s     | 79s      | **67s**   |
+| Extract archive | **38s** | 99s      | 48s      | 48s       |
+| Archive size    | 99 MB   | 64 MB    | 64 MB    | **64 MB** |
+
+## License
+
+MIT License. See [LICENSE](LICENSE).
