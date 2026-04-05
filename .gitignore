@@ -124,3 +124,46 @@ cython_debug/
 
 # VS Code
 .vscode/
+
+# Rust
+## Build artifacts
+src/rust/target/
+src/rust/har-rust
+src/rust/har-rust-static
+**/*.rs.bk
+
+## Toolchain / environment
+src/rust/.cargo_home/
+src/rust/.rustup_home/
+
+## Cargo lock (library pattern — remove if this is an application)
+# src/rust/Cargo.lock
+
+## Sandbox / container
+src/rust/rust_sandbox/
+src/rust/*.sif
+
+## Debug / profiling
+*.pdb
+*.dSYM/
+perf.data
+perf.data.old
+flamegraph.svg
+callgrind.out.*
+cachegrind.out.*
+
+## IDE / editor (Rust-specific)
+.cargo/
+rust-project.json
+
+## Generated docs
+src/rust/doc/
+
+## Benchmarks
+src/rust/criterion/
+
+## Coverage
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html

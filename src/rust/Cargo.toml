@@ -1,0 +1,20 @@
+[package]
+name = "har"
+version = "1.0.0"
+edition = "2021"
+description = "HDF5 Archive Utility - a tar-like tool using HDF5 format"
+
+[[bin]]
+name = "har"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+hdf5 = "0.8"
+rayon = "1.10"
+walkdir = "2"
+shellexpand = "3"
+pathdiff = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,17 @@
+Bootstrap: docker
+From: rust:1.86-bookworm
+
+%post
+    apt-get update && apt-get install -y \
+        libhdf5-dev \
+        pkg-config \
+        cmake \
+        && rm -rf /var/lib/apt/lists/*
+
+%environment
+    export HDF5_DIR=/usr
+    export PATH="/usr/local/cargo/bin:${PATH}"
+
+%labels
+    Author har
+    Description Rust toolchain with HDF5 development libraries for building har
