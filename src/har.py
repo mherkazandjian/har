@@ -41,16 +41,45 @@ Usage Examples:
 import os
 import sys
 import argparse
+import concurrent.futures
 import h5py
 import numpy as np
 import time
+
+
+def _read_file(file_path):
+    """Read a file's bytes and permission mode. Unit of work for ThreadPoolExecutor."""
+    with open(file_path, 'rb') as fobj:
+        content = fobj.read()
+    mode = os.stat(file_path).st_mode
+    return content, mode
+
+
+def _write_extracted_file(args):
+    """Write a single extracted file to disk. Unit of work for ThreadPoolExecutor."""
+    name, file_bytes, mode, extract_dir = args
+    dest_file_path = os.path.join(extract_dir, name)
+    os.makedirs(os.path.dirname(dest_file_path), exist_ok=True)
+    with open(dest_file_path, 'wb') as fout:
+        fout.write(file_bytes)
+    if mode is not None:
+        os.chmod(dest_file_path, mode)
+
+
+def _chunk_list(lst, n):
+    """Split lst into n roughly equal chunks."""
+    k, m = divmod(len(lst), n)
+    return [lst[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n)]
+
 
 def pack_or_append_to_h5(sources,
                          output_h5,
                          file_mode,
                          compression=None,
                          compression_opts=None,
-                         shuffle=False):
+                         shuffle=False,
+                         parallel=1,
+                         verbose=False):
     """
     Archive or append the given sources (directories and/or files) into the HDF5 archive.
 
@@ -60,70 +89,110 @@ def pack_or_append_to_h5(sources,
     :param compression: Compression strategy (e.g., 'gzip', 'lzf', etc.).
     :param compression_opts: Compression options (e.g., level for 'gzip').
     :param shuffle: Whether to use the shuffle filter.
+    :param parallel: Number of parallel workers for file reads (default: 1).
+    :param verbose: Print filenames as they are processed (default: False).
     """
     output_h5 = os.path.expanduser(output_h5)
     t0 = time.time()
 
-    with h5py.File(output_h5, file_mode) as h5fobj:
-        def process_file(file_path, base_dir):
-            """Process a single file and add it to the archive."""
-            if base_dir:
-                rel_path = os.path.relpath(file_path, base_dir)
-            else:
-                rel_path = os.path.basename(file_path)
+    # Phase 1: Collect file inventory and empty directories.
+    file_entries = []  # list of (file_path, rel_path)
+    empty_dirs = []    # list of rel_dir strings
+    for source in sources:
+        source = os.path.expanduser(source)
+        if os.path.isdir(source):
+            source = os.path.normpath(source)
+            base_dir = os.path.dirname(os.path.abspath(source))
+            for root, dirs, files in os.walk(source):
+                for fname in files:
+                    file_path = os.path.join(root, fname)
+                    rel_path = os.path.relpath(file_path, base_dir)
+                    file_entries.append((file_path, rel_path))
+                if not files and not dirs:
+                    rel_dir = os.path.relpath(root, base_dir)
+                    empty_dirs.append(rel_dir)
+        elif os.path.isfile(source):
+            rel_path = os.path.basename(source)
+            file_entries.append((source, rel_path))
+        else:
+            print(f"Warning: '{source}' is not a valid file or directory; skipping.", file=sys.stderr)
+
+    def _write_to_h5(h5fobj, rel_path, content, mode, create_groups=True):
+        """Write a single file's data to the HDF5 archive."""
+        if verbose:
             print("Storing:", rel_path)
-            if file_mode == 'a' and rel_path in h5fobj:
+        if file_mode == 'a' and rel_path in h5fobj:
+            if verbose:
                 print(f"Skipping {rel_path} (already exists)")
-                return
+            return
+        if create_groups:
             group_path = os.path.dirname(rel_path)
             if group_path:
                 h5fobj.require_group(group_path)
-            with open(file_path, 'rb') as fobj:
-                file_content = fobj.read()
-            file_data = np.frombuffer(file_content, dtype=np.uint8)
-            ds = h5fobj.create_dataset(
-                rel_path,
-                data=file_data,
-                dtype=np.uint8,
-                compression=compression,
-                compression_opts=compression_opts,
-                shuffle=shuffle
-            )
-            # Store file permissions as an attribute.
-            ds.attrs['mode'] = os.stat(file_path).st_mode
+        file_data = np.frombuffer(content, dtype=np.uint8)
+        ds = h5fobj.create_dataset(
+            rel_path,
+            data=file_data,
+            dtype=np.uint8,
+            compression=compression,
+            compression_opts=compression_opts,
+            shuffle=shuffle
+        )
+        ds.attrs['mode'] = mode
 
-        # Process each source.
-        for source in sources:
-            source = os.path.expanduser(source)
-            if os.path.isdir(source):
-                # Use the parent of the source so the directory name is preserved
-                # in the archive (matching tar behavior).
-                source = os.path.normpath(source)
-                base_dir = os.path.dirname(os.path.abspath(source))
-                # Process the directory recursively.
-                for root, dirs, files in os.walk(source):
-                    for fname in files:
-                        file_path = os.path.join(root, fname)
-                        process_file(file_path, base_dir)
-                    # Store empty directories as groups with a marker attribute.
-                    if not files and not dirs:
-                        rel_dir = os.path.relpath(root, base_dir)
-                        grp = h5fobj.require_group(rel_dir)
-                        grp.attrs['empty_dir'] = True
-                        print(f"Storing empty dir: {rel_dir}")
-            elif os.path.isfile(source):
-                process_file(source, None)
-            else:
-                print(f"Warning: '{source}' is not a valid file or directory; skipping.", file=sys.stderr)
+    if parallel <= 1:
+        # Sequential path: read and write one file at a time (no extra memory).
+        with h5py.File(output_h5, file_mode) as h5fobj:
+            for file_path, rel_path in file_entries:
+                content, mode = _read_file(file_path)
+                _write_to_h5(h5fobj, rel_path, content, mode)
+            for rel_dir in empty_dirs:
+                grp = h5fobj.require_group(rel_dir)
+                grp.attrs['empty_dir'] = True
+                if verbose:
+                    print(f"Storing empty dir: {rel_dir}")
+    else:
+        # Parallel path: read files in parallel, then write to HDF5.
+        # Pre-collect all unique group paths to batch-create them.
+        all_groups = set()
+        for _, rel_path in file_entries:
+            g = os.path.dirname(rel_path)
+            if g:
+                all_groups.add(g)
+
+        # Phase 2: Parallel file reads (collect all results first).
+        read_results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = [executor.submit(_read_file, fp) for fp, _ in file_entries]
+            for (_, rel_path), future in zip(file_entries, futures):
+                content, mode = future.result()
+                read_results.append((rel_path, content, mode))
+
+        # Phase 3: Serial HDF5 writes (no thread pool overhead, no require_group).
+        with h5py.File(output_h5, file_mode) as h5fobj:
+            for g in sorted(all_groups):
+                h5fobj.require_group(g)
+            for rel_path, content, mode in read_results:
+                _write_to_h5(h5fobj, rel_path, content, mode, create_groups=False)
+            for rel_dir in empty_dirs:
+                grp = h5fobj.require_group(rel_dir)
+                grp.attrs['empty_dir'] = True
+                if verbose:
+                    print(f"Storing empty dir: {rel_dir}")
+
     t1 = time.time()
     print(f"\nOperation completed in {t1 - t0:.2f} seconds.")
 
-def extract_h5_to_directory(h5_path, extract_dir, file_key=None):
+def extract_h5_to_directory(h5_path, extract_dir, file_key=None, parallel=1,
+                            verbose=False):
     """
     Extract files from an HDF5 file.
       - If file_key is None, extract the entire archive.
       - Otherwise, extract only the dataset corresponding to file_key.
     Files are extracted into extract_dir.
+
+    :param parallel: Number of parallel workers for extraction (default: 1).
+    :param verbose: Print filenames as they are extracted (default: False).
     """
     h5_path = os.path.expanduser(h5_path)
     extract_dir = os.path.expanduser(extract_dir)
@@ -135,8 +204,10 @@ def extract_h5_to_directory(h5_path, extract_dir, file_key=None):
     except OSError as e:
         print(f"Error: cannot open '{h5_path}': {e}", file=sys.stderr)
         sys.exit(1)
-    with h5fobj:
-        if file_key:
+
+    if file_key:
+        # Single file extraction — always sequential.
+        with h5fobj:
             if file_key not in h5fobj:
                 print(f"Error: '{file_key}' not found in archive.", file=sys.stderr)
                 sys.exit(1)
@@ -148,8 +219,11 @@ def extract_h5_to_directory(h5_path, extract_dir, file_key=None):
                 fout.write(file_bytes)
             if 'mode' in dataset.attrs:
                 os.chmod(dest_file_path, dataset.attrs['mode'])
-            print(f"Extracted: {file_key}")
-        else:
+            if verbose:
+                print(f"Extracted: {file_key}")
+    elif parallel <= 1:
+        # Sequential full extraction.
+        with h5fobj:
             def extract_item(name, obj):
                 if isinstance(obj, h5py.Dataset):
                     dest_file_path = os.path.join(extract_dir, name)
@@ -159,12 +233,45 @@ def extract_h5_to_directory(h5_path, extract_dir, file_key=None):
                         fout.write(file_bytes)
                     if 'mode' in obj.attrs:
                         os.chmod(dest_file_path, obj.attrs['mode'])
-                    print(f"Extracted: {name}")
+                    if verbose:
+                        print(f"Extracted: {name}")
                 elif isinstance(obj, h5py.Group) and obj.attrs.get('empty_dir'):
                     dest_dir_path = os.path.join(extract_dir, name)
                     os.makedirs(dest_dir_path, exist_ok=True)
-                    print(f"Created empty dir: {name}")
+                    if verbose:
+                        print(f"Created empty dir: {name}")
             h5fobj.visititems(extract_item)
+    else:
+        # Parallel full extraction.
+        # Phase 1: Bulk read all datasets from HDF5 sequentially into memory.
+        # (Single file sequential I/O is fast; filesystem writes are the bottleneck.)
+        read_items = []  # list of (name, bytes, mode|None)
+        empty_dir_names = []
+        with h5fobj:
+            def collector(name, obj):
+                if isinstance(obj, h5py.Dataset):
+                    file_bytes = obj[()].tobytes()
+                    mode = obj.attrs.get('mode', None)
+                    read_items.append((name, file_bytes, mode))
+                elif isinstance(obj, h5py.Group) and obj.attrs.get('empty_dir'):
+                    empty_dir_names.append(name)
+            h5fobj.visititems(collector)
+
+        # Phase 2: Create empty directories (sequential, fast).
+        for name in empty_dir_names:
+            dest_dir_path = os.path.join(extract_dir, name)
+            os.makedirs(dest_dir_path, exist_ok=True)
+            if verbose:
+                print(f"Created empty dir: {name}")
+
+        # Phase 3: Write files to filesystem in parallel.
+        work_items = [(name, data, mode, extract_dir) for name, data, mode in read_items]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
+            executor.map(_write_extracted_file, work_items)
+        if verbose:
+            for name, _, _, _ in work_items:
+                print(f"Extracted: {name}")
+
     print("Extraction complete!")
 
 def list_h5_contents(h5_path):
@@ -199,6 +306,8 @@ def main():
     group.add_argument("-x", action="store_true", help="Extract from an archive.")
     group.add_argument("-t", action="store_true", help="List contents of an archive.")
 
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbosely list files processed.")
+
     # Required HDF5 file.
     parser.add_argument("-f", "--file", required=True,
                         help="HDF5 archive file (for output when archiving/appending; for input when extracting/listing).")
@@ -208,12 +317,20 @@ def main():
                         help="Target extraction directory (default: current directory).")
 
     # Compression options.
-    parser.add_argument("-z", "--gzip", action="store_true", help="Use gzip compression.")
-    parser.add_argument("--lzf", action="store_true", help="Use hdf5 lzf compression.")
-    parser.add_argument("--szip", action="store_true", help="Use hdf5 szip compression.")
-    parser.add_argument("--zopt", type=str, default="9", help="Compression level for gzip (default: 9).")
-    # for szip the compression options is a comman separated string of 2 values
-    parser.add_argument("--shuffle", action="store_true", help="Use shuffle filter.")
+    parser.add_argument("-z", "--gzip", action="store_true",
+                        help="Use gzip compression (off by default; no compression unless -z, --lzf, or --szip is given).")
+    parser.add_argument("--lzf", action="store_true",
+                        help="Use hdf5 lzf compression (fast, moderate ratio; off by default).")
+    parser.add_argument("--szip", action="store_true",
+                        help="Use hdf5 szip compression (off by default, untested).")
+    parser.add_argument("--zopt", type=str, default="9",
+                        help="Compression level for gzip 1-9 (default: 9). Ignored for lzf.")
+    parser.add_argument("--shuffle", action="store_true",
+                        help="Use HDF5 shuffle filter before compression (off by default).")
+
+    # Parallelism.
+    parser.add_argument("-p", "--parallel", type=int, default=1,
+                        help="Number of parallel workers (default: 1 = sequential).")
 
     # Positional argument:
     # For -c and -r: one or more source directories or files.
@@ -224,6 +341,10 @@ def main():
         "for -x: file key to extract (if omitted, extract entire archive)."))
 
     args = parser.parse_args()
+
+    if args.parallel < 1:
+        print("Error: --parallel must be >= 1.", file=sys.stderr)
+        sys.exit(1)
 
     h5_file = args.file
     target_dir = args.directory  # For extraction, the target directory.
@@ -265,7 +386,9 @@ def main():
             'w',
             compression=compression,
             compression_opts=compression_opts,
-            shuffle=args.shuffle)
+            shuffle=args.shuffle,
+            parallel=args.parallel,
+            verbose=args.verbose)
     elif args.r:
         # Append to archive.
         if not sources:
@@ -277,12 +400,16 @@ def main():
             'a',
             compression=compression,
             compression_opts=compression_opts,
-            shuffle=args.shuffle)
+            shuffle=args.shuffle,
+            parallel=args.parallel,
+            verbose=args.verbose)
     elif args.x:
         # Extract from archive.
         # If sources is not empty, treat the first source as the file key.
         file_key = sources[0] if sources else None
-        extract_h5_to_directory(h5_file, target_dir, file_key=file_key)
+        extract_h5_to_directory(h5_file, target_dir, file_key=file_key,
+                                parallel=args.parallel,
+                                verbose=args.verbose)
     elif args.t:
         # List contents.
         list_h5_contents(h5_file)

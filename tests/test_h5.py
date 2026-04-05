@@ -261,3 +261,208 @@ def test_compression_roundtrip():
 
         # Compressed file should be much smaller than 100KB
         assert os.path.getsize(archive) < 10000
+
+
+# ---- Parallel tests ----
+
+def _make_test_tree(base, n_dirs=3, n_files_per_dir=4):
+    """Helper to create a test directory tree with files."""
+    for i in range(n_dirs):
+        d = os.path.join(base, f"dir{i}")
+        os.makedirs(d)
+        for j in range(n_files_per_dir):
+            with open(os.path.join(d, f"file{j}.txt"), "w") as f:
+                f.write(f"content dir{i}/file{j}")
+
+
+def test_parallel_ingest():
+    """Parallel ingest produces correct archive contents."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "src")
+        os.makedirs(src)
+        _make_test_tree(src)
+
+        archive = os.path.join(tmp, "par.h5")
+        pack_or_append_to_h5([src], archive, 'w', parallel=4)
+
+        with h5py.File(archive, 'r') as h5f:
+            keys = []
+            h5f.visititems(lambda n, o: keys.append(n) if isinstance(o, h5py.Dataset) else None)
+            assert len(keys) == 12  # 3 dirs * 4 files
+
+        extract_dir = os.path.join(tmp, "out")
+        os.makedirs(extract_dir)
+        extract_h5_to_directory(archive, extract_dir)
+        for i in range(3):
+            for j in range(4):
+                p = os.path.join(extract_dir, "src", f"dir{i}", f"file{j}.txt")
+                assert os.path.exists(p)
+                with open(p) as f:
+                    assert f.read() == f"content dir{i}/file{j}"
+
+
+def test_parallel_extract():
+    """Parallel extract produces correct output from sequentially created archive."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "src")
+        os.makedirs(src)
+        _make_test_tree(src)
+
+        archive = os.path.join(tmp, "seq.h5")
+        pack_or_append_to_h5([src], archive, 'w')  # sequential ingest
+
+        extract_dir = os.path.join(tmp, "out")
+        os.makedirs(extract_dir)
+        extract_h5_to_directory(archive, extract_dir, parallel=4)
+
+        for i in range(3):
+            for j in range(4):
+                p = os.path.join(extract_dir, "src", f"dir{i}", f"file{j}.txt")
+                with open(p) as f:
+                    assert f.read() == f"content dir{i}/file{j}"
+
+
+def test_parallel_roundtrip():
+    """Parallel ingest + parallel extract end-to-end with diverse content."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "project")
+        os.makedirs(os.path.join(src, "data"))
+        os.makedirs(os.path.join(src, "empty_sub"))
+
+        with open(os.path.join(src, "readme.txt"), "w") as f:
+            f.write("hello")
+        with open(os.path.join(src, "data", "bin.dat"), "wb") as f:
+            f.write(bytes(range(256)))
+        exec_file = os.path.join(src, "data", "run.sh")
+        with open(exec_file, "w") as f:
+            f.write("#!/bin/bash")
+        os.chmod(exec_file, 0o755)
+
+        archive = os.path.join(tmp, "rt.h5")
+        pack_or_append_to_h5([src], archive, 'w', parallel=3)
+
+        extract_dir = os.path.join(tmp, "out")
+        os.makedirs(extract_dir)
+        extract_h5_to_directory(archive, extract_dir, parallel=3)
+
+        # Verify text file
+        with open(os.path.join(extract_dir, "project", "readme.txt")) as f:
+            assert f.read() == "hello"
+        # Verify binary file
+        with open(os.path.join(extract_dir, "project", "data", "bin.dat"), "rb") as f:
+            assert f.read() == bytes(range(256))
+        # Verify permissions
+        assert os.stat(os.path.join(extract_dir, "project", "data", "run.sh")).st_mode == os.stat(exec_file).st_mode
+        # Verify empty dir
+        assert os.path.isdir(os.path.join(extract_dir, "project", "empty_sub"))
+
+
+def test_parallel_ingest_with_compression():
+    """Parallel ingest with gzip+shuffle works correctly."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "comp")
+        os.makedirs(src)
+        with open(os.path.join(src, "big.txt"), "w") as f:
+            f.write("B" * 50000)
+
+        archive = os.path.join(tmp, "comp.h5")
+        pack_or_append_to_h5([src], archive, 'w',
+                             compression='gzip', compression_opts=9, shuffle=True,
+                             parallel=2)
+
+        extract_dir = os.path.join(tmp, "out")
+        os.makedirs(extract_dir)
+        extract_h5_to_directory(archive, extract_dir)
+        with open(os.path.join(extract_dir, "comp", "big.txt")) as f:
+            assert f.read() == "B" * 50000
+        assert os.path.getsize(archive) < 5000
+
+
+def test_parallel_append_skips_existing():
+    """Append with parallel skips existing entries."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "app")
+        os.makedirs(src)
+        with open(os.path.join(src, "f.txt"), "w") as f:
+            f.write("v1")
+
+        archive = os.path.join(tmp, "app.h5")
+        pack_or_append_to_h5([src], archive, 'w', parallel=2)
+
+        # Modify and append — should skip existing
+        with open(os.path.join(src, "f.txt"), "w") as f:
+            f.write("v2")
+        with open(os.path.join(src, "new.txt"), "w") as f:
+            f.write("new")
+        pack_or_append_to_h5([src], archive, 'a', parallel=2)
+
+        with h5py.File(archive, 'r') as h5f:
+            assert h5f["app/f.txt"][()].tobytes() == b"v1"  # original kept
+            assert h5f["app/new.txt"][()].tobytes() == b"new"
+
+
+def test_parallel_extract_preserves_permissions():
+    """Parallel extraction restores file permissions."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "perms")
+        os.makedirs(src)
+        f = os.path.join(src, "exec.sh")
+        with open(f, "w") as fh:
+            fh.write("#!/bin/bash")
+        os.chmod(f, 0o755)
+
+        archive = os.path.join(tmp, "perms.h5")
+        pack_or_append_to_h5([src], archive, 'w')
+
+        extract_dir = os.path.join(tmp, "out")
+        os.makedirs(extract_dir)
+        extract_h5_to_directory(archive, extract_dir, parallel=2)
+
+        assert os.stat(os.path.join(extract_dir, "perms", "exec.sh")).st_mode == os.stat(f).st_mode
+
+
+def test_parallel_extract_preserves_empty_dirs():
+    """Parallel extraction creates empty directories."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "emp")
+        os.makedirs(os.path.join(src, "empty"))
+        os.makedirs(os.path.join(src, "full"))
+        with open(os.path.join(src, "full", "f.txt"), "w") as f:
+            f.write("data")
+
+        archive = os.path.join(tmp, "emp.h5")
+        pack_or_append_to_h5([src], archive, 'w')
+
+        extract_dir = os.path.join(tmp, "out")
+        os.makedirs(extract_dir)
+        extract_h5_to_directory(archive, extract_dir, parallel=2)
+
+        assert os.path.isdir(os.path.join(extract_dir, "emp", "empty"))
+        assert os.path.isfile(os.path.join(extract_dir, "emp", "full", "f.txt"))
+
+
+def test_parallel_many_small_files():
+    """Stress test: 100 files across 10 dirs with parallel=8."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "many")
+        os.makedirs(src)
+        _make_test_tree(src, n_dirs=10, n_files_per_dir=10)
+
+        archive = os.path.join(tmp, "many.h5")
+        pack_or_append_to_h5([src], archive, 'w', parallel=8)
+
+        extract_dir = os.path.join(tmp, "out")
+        os.makedirs(extract_dir)
+        extract_h5_to_directory(archive, extract_dir, parallel=8)
+
+        count = 0
+        for r, d, files in os.walk(os.path.join(extract_dir, "many")):
+            count += len(files)
+        assert count == 100
+
+        # Spot check a few files
+        for i in [0, 5, 9]:
+            for j in [0, 5, 9]:
+                p = os.path.join(extract_dir, "many", f"dir{i}", f"file{j}.txt")
+                with open(p) as f:
+                    assert f.read() == f"content dir{i}/file{j}"
