@@ -16,9 +16,47 @@ per-file metadata, and indexed random access.
 
 ## Installation
 
+### Python
+
 ```sh
 pip install .
 ```
+
+### Rust
+
+Rust builds use a containerized toolchain by default. Choose a backend with `container=`:
+
+```sh
+# Apptainer (default) — suited for HPC / shared clusters
+make rust-sandbox                              # one-time: create build environment
+make build-rust-release                        # dynamic binary -> src/rust/har-rust
+make rust-static-sandbox                       # one-time: create static build environment
+make build-rust-release-static                 # static musl binary -> src/rust/har-rust-static
+
+# Docker — suited for workstations / CI
+make build-rust-release container=docker
+make build-rust-release-static container=docker
+
+# Native — no container, uses host toolchain directly
+make build-rust-release container=native
+make build-rust-release-static container=native
+```
+
+The static binary (`har-rust-static`) is a ~4.6 MB standalone executable with zero runtime dependencies, built against musl libc.
+
+All available targets:
+
+| Target | Description |
+|--------|-------------|
+| `build-rust-release` | Release build, dynamic linking |
+| `build-rust-release-static` | Release build, static musl |
+| `build-rust-debug` | Debug build, dynamic linking |
+| `build-rust-static` | Debug build, static musl |
+| `rust-sandbox` | Create the dynamic build environment |
+| `rust-static-sandbox` | Create the static build environment |
+| `test-rust` | Run Rust test suite |
+| `clean-rust` | Remove build artifacts |
+| `install-rust` | Copy binaries to `DESTDIR` (default `/usr/local/bin`) |
 
 ## Usage
 
