@@ -29,6 +29,11 @@ struct InventoryItem {
     content: Vec<u8>,
     mode: u32,
     sha256: String,
+    uid: u32,
+    gid: u32,
+    mtime: f64,
+    owner: String,
+    group: String,
 }
 
 struct BatchFile {
@@ -37,6 +42,11 @@ struct BatchFile {
     mode: u32,
     sha256: String,
     offset: usize,
+    uid: u32,
+    gid: u32,
+    mtime: f64,
+    owner: String,
+    group: String,
 }
 
 struct Batch {
@@ -75,12 +85,35 @@ fn human_size(bytes: usize) -> String {
     format!("{:.1} PB", size)
 }
 
-fn read_and_hash(path: &Path, algo: &str) -> std::io::Result<(Vec<u8>, u32, String)> {
+struct HashResult {
+    content: Vec<u8>,
+    mode: u32,
+    hash: String,
+    uid: u32,
+    gid: u32,
+    mtime: f64,
+    owner: String,
+    group: String,
+}
+
+fn read_and_hash(path: &Path, algo: &str) -> std::io::Result<HashResult> {
     let mut content = Vec::new();
     fs::File::open(path)?.read_to_end(&mut content)?;
-    let mode = fs::metadata(path)?.permissions().mode();
+    let meta = fs::metadata(path)?;
+    let mode = meta.permissions().mode();
+    use std::os::unix::fs::MetadataExt;
+    let uid = meta.uid();
+    let gid = meta.gid();
+    let mtime = meta.modified()?.duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_secs_f64();
+    let owner = users::get_user_by_uid(uid)
+        .map(|u| u.name().to_string_lossy().to_string())
+        .unwrap_or_else(|| uid.to_string());
+    let group = users::get_group_by_gid(gid)
+        .map(|g| g.name().to_string_lossy().to_string())
+        .unwrap_or_else(|| gid.to_string());
     let hash = crate::compute_checksum(&content, algo);
-    Ok((content, mode, hash))
+    Ok(HashResult { content, mode, hash, uid, gid, mtime, owner, group })
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +203,11 @@ fn assign_batches(inventory: Vec<InventoryItem>, batch_size: usize) -> Vec<Batch
             mode: item.mode,
             sha256: item.sha256,
             offset: current_bytes,
+            uid: item.uid,
+            gid: item.gid,
+            mtime: item.mtime,
+            owner: item.owner,
+            group: item.group,
         });
         current_bytes += fsize;
     }
@@ -264,7 +302,7 @@ pub fn pack_bagit(
         sorted_entries
             .iter()
             .map(|e| {
-                let (content, mode, hash) = read_and_hash(&e.file_path, hash_algo).expect("Failed to read file");
+                let hr = read_and_hash(&e.file_path, hash_algo).expect("Failed to read file");
                 if xattr_flag {
                     let xattrs = crate::metadata::read_xattrs(&e.file_path);
                     if !xattrs.is_empty() {
@@ -285,9 +323,11 @@ pub fn pack_bagit(
                 }
                 InventoryItem {
                     bagit_path: format!("data/{}", e.rel_path),
-                    content,
-                    mode,
-                    sha256: hash,
+                    content: hr.content,
+                    mode: hr.mode,
+                    sha256: hr.hash,
+                    uid: hr.uid, gid: hr.gid, mtime: hr.mtime,
+                    owner: hr.owner, group: hr.group,
                 }
             })
             .collect()
@@ -300,13 +340,14 @@ pub fn pack_bagit(
             sorted_entries
                 .par_iter()
                 .map(|e| {
-                    let (content, mode, hash) =
-                        read_and_hash(&e.file_path, hash_algo).expect("Failed to read file");
+                    let hr = read_and_hash(&e.file_path, hash_algo).expect("Failed to read file");
                     InventoryItem {
                         bagit_path: format!("data/{}", e.rel_path),
-                        content,
-                        mode,
-                        sha256: hash,
+                        content: hr.content,
+                        mode: hr.mode,
+                        sha256: hr.hash,
+                        uid: hr.uid, gid: hr.gid, mtime: hr.mtime,
+                        owner: hr.owner, group: hr.group,
                     }
                 })
                 .collect()
@@ -413,6 +454,11 @@ pub fn pack_bagit(
         .iter()
         .flat_map(|b| b.files.iter().map(|f| f.sha256.clone()))
         .collect();
+    let uids: Vec<u32> = batches.iter().flat_map(|b| b.files.iter().map(|f| f.uid)).collect();
+    let gids: Vec<u32> = batches.iter().flat_map(|b| b.files.iter().map(|f| f.gid)).collect();
+    let mtimes: Vec<f64> = batches.iter().flat_map(|b| b.files.iter().map(|f| f.mtime)).collect();
+    let owners: Vec<String> = batches.iter().flat_map(|b| b.files.iter().map(|f| f.owner.clone())).collect();
+    let groups: Vec<String> = batches.iter().flat_map(|b| b.files.iter().map(|f| f.group.clone())).collect();
 
     // Write arrays
     idx_grp.new_dataset::<u32>().shape(batch_ids.len()).create("batch_id").unwrap()
@@ -431,6 +477,20 @@ pub fn pack_bagit(
     let shas_blob = shas.join("\n").into_bytes();
     idx_grp.new_dataset::<u8>().shape(shas_blob.len()).create("sha256s").unwrap()
         .write_raw(&shas_blob).unwrap();
+
+    // Owner/group/mtime arrays
+    idx_grp.new_dataset::<u32>().shape(uids.len()).create("uid").unwrap()
+        .write_raw(&uids).unwrap();
+    idx_grp.new_dataset::<u32>().shape(gids.len()).create("gid").unwrap()
+        .write_raw(&gids).unwrap();
+    idx_grp.new_dataset::<f64>().shape(mtimes.len()).create("mtime").unwrap()
+        .write_raw(&mtimes).unwrap();
+    let owners_blob = owners.join("\n").into_bytes();
+    idx_grp.new_dataset::<u8>().shape(owners_blob.len()).create("owners").unwrap()
+        .write_raw(&owners_blob).unwrap();
+    let groups_blob = groups.join("\n").into_bytes();
+    idx_grp.new_dataset::<u8>().shape(groups_blob.len()).create("groups").unwrap()
+        .write_raw(&groups_blob).unwrap();
 
     // Store file count for parsing
     idx_grp.new_attr::<u64>().shape(()).create("count").unwrap()

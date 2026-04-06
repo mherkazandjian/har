@@ -143,14 +143,42 @@ struct ReadResult {
     rel_path: String,
     content: Vec<u8>,
     mode: u32,
+    uid: u32,
+    gid: u32,
+    owner: String,
+    group: String,
+    mtime: f64,
 }
 
-/// Read a file's bytes and permission mode.
-fn read_file(path: &Path) -> io::Result<(Vec<u8>, u32)> {
+/// File data read from the filesystem.
+struct FileData {
+    content: Vec<u8>,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    owner: String,
+    group: String,
+    mtime: f64,
+}
+
+/// Read a file's bytes and metadata.
+fn read_file(path: &Path) -> io::Result<FileData> {
     let mut content = Vec::new();
     fs::File::open(path)?.read_to_end(&mut content)?;
-    let mode = fs::metadata(path)?.permissions().mode();
-    Ok((content, mode))
+    let meta = fs::metadata(path)?;
+    let mode = meta.permissions().mode();
+    use std::os::unix::fs::MetadataExt;
+    let uid = meta.uid();
+    let gid = meta.gid();
+    let mtime = meta.modified()?.duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_secs_f64();
+    let owner = users::get_user_by_uid(uid)
+        .map(|u| u.name().to_string_lossy().to_string())
+        .unwrap_or_else(|| uid.to_string());
+    let group = users::get_group_by_gid(gid)
+        .map(|g| g.name().to_string_lossy().to_string())
+        .unwrap_or_else(|| gid.to_string());
+    Ok(FileData { content, mode, uid, gid, owner, group, mtime })
 }
 
 /// Read dataset content, automatically decompressing LZMA if marked.
@@ -374,7 +402,9 @@ pub fn pack_or_append_to_h5(
     let verbose_file = verbose && !progress.is_tty;
 
     let write_to_h5 =
-        |h5f: &hdf5::File, rel_path: &str, content: &[u8], mode: u32, create_groups: bool, file_path: Option<&Path>| {
+        |h5f: &hdf5::File, rel_path: &str, content: &[u8], mode: u32,
+         uid: u32, gid: u32, owner: &str, group: &str, mtime: f64,
+         create_groups: bool, file_path: Option<&Path>| {
             if verbose_file {
                 println!("Storing: {}", rel_path);
             }
@@ -393,12 +423,14 @@ pub fn pack_or_append_to_h5(
                 }
             }
             let ds = create_dataset(h5f, rel_path, content, compression, compression_opts, shuffle, checksum);
-            ds.new_attr::<u32>()
-                .shape(())
-                .create("mode")
-                .expect("Failed to create mode attr")
-                .write_scalar(&mode)
-                .expect("Failed to write mode attr");
+            ds.new_attr::<u32>().shape(()).create("mode").expect("create mode").write_scalar(&mode).expect("write mode");
+            ds.new_attr::<u32>().shape(()).create("uid").expect("create uid").write_scalar(&uid).expect("write uid");
+            ds.new_attr::<u32>().shape(()).create("gid").expect("create gid").write_scalar(&gid).expect("write gid");
+            ds.new_attr::<f64>().shape(()).create("mtime").expect("create mtime").write_scalar(&mtime).expect("write mtime");
+            let owner_vu: hdf5::types::VarLenUnicode = owner.parse().unwrap();
+            ds.new_attr::<hdf5::types::VarLenUnicode>().shape(()).create("owner").expect("create owner").write_scalar(&owner_vu).expect("write owner");
+            let group_vu: hdf5::types::VarLenUnicode = group.parse().unwrap();
+            ds.new_attr::<hdf5::types::VarLenUnicode>().shape(()).create("group").expect("create group").write_scalar(&group_vu).expect("write group");
             if xattr_flag {
                 if let Some(fp) = file_path {
                     let xattrs = metadata::read_xattrs(fp);
@@ -415,8 +447,8 @@ pub fn pack_or_append_to_h5(
     if parallel <= 1 {
         // Sequential path
         for entry in &file_entries {
-            let (content, mode) = read_file(&entry.file_path).expect("Failed to read file");
-            write_to_h5(&h5f, &entry.rel_path, &content, mode, true, Some(&entry.file_path));
+            let fd = read_file(&entry.file_path).expect("Failed to read file");
+            write_to_h5(&h5f, &entry.rel_path, &fd.content, fd.mode, fd.uid, fd.gid, &fd.owner, &fd.group, fd.mtime, true, Some(&entry.file_path));
             progress.inc(&entry.rel_path);
         }
     } else {
@@ -443,20 +475,22 @@ pub fn pack_or_append_to_h5(
             file_entries
                 .par_iter()
                 .map(|entry| {
-                    let (content, mode) =
-                        read_file(&entry.file_path).expect("Failed to read file");
+                    let fd = read_file(&entry.file_path).expect("Failed to read file");
                     ReadResult {
                         file_path: entry.file_path.clone(),
                         rel_path: entry.rel_path.clone(),
-                        content,
-                        mode,
+                        content: fd.content,
+                        mode: fd.mode,
+                        uid: fd.uid, gid: fd.gid,
+                        owner: fd.owner, group: fd.group,
+                        mtime: fd.mtime,
                     }
                 })
                 .collect()
         });
 
         for r in &read_results {
-            write_to_h5(&h5f, &r.rel_path, &r.content, r.mode, false, Some(&r.file_path));
+            write_to_h5(&h5f, &r.rel_path, &r.content, r.mode, r.uid, r.gid, &r.owner, &r.group, r.mtime, false, Some(&r.file_path));
             progress.inc(&r.rel_path);
         }
     }
@@ -780,6 +814,7 @@ pub fn list_h5_contents(h5_path: &str) {
 
 pub mod bagit;
 pub mod metadata;
+pub mod browse;
 
 #[cfg(test)]
 mod tests;

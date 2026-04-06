@@ -91,6 +91,11 @@ INDEX_DTYPE = np.dtype([
     ('length',   np.uint64),
     ('mode',     np.uint32),
     ('sha256',   'S64'),
+    ('uid',      np.uint32),
+    ('gid',      np.uint32),
+    ('mtime',    np.float64),
+    ('owner',    'S256'),
+    ('group_name', 'S256'),
 ])
 
 # ---------------------------------------------------------------------------
@@ -116,12 +121,25 @@ def _human_size(nbytes):
 
 
 def _read_and_hash(file_path, algo='sha256'):
-    """Read file bytes, compute checksum, return (content, mode, hash_hex)."""
+    """Read file bytes, compute checksum, return (content, mode, hash_hex, uid, gid, mtime, owner, group_name)."""
     with open(file_path, 'rb') as f:
         content = f.read()
-    mode = os.stat(file_path).st_mode
+    st = os.stat(file_path)
+    mode = st.st_mode
+    uid = st.st_uid
+    gid = st.st_gid
+    mtime = st.st_mtime
+    import pwd, grp as grp_mod
+    try:
+        owner = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        owner = str(uid)
+    try:
+        group_name = grp_mod.getgrgid(gid).gr_name
+    except KeyError:
+        group_name = str(gid)
     hash_hex = compute_checksum(content, algo)
-    return content, mode, hash_hex
+    return content, mode, hash_hex, uid, gid, mtime, owner, group_name
 
 
 def _checksum_bytes(data, algo='sha256'):
@@ -175,12 +193,12 @@ def is_bagit_archive(h5_path):
 def _assign_batches(inventory, batch_size):
     """Assign files to batches.
 
-    inventory: list of (rel_path, content_bytes, mode, sha256_hex)
+    inventory: list of (rel_path, content_bytes, mode, sha256_hex, uid, gid, mtime, owner, group_name)
                sorted by rel_path.
 
     Returns list of batch dicts:
       [{'id': int,
-        'files': [(rel_path, content, mode, sha256, offset_in_batch), ...],
+        'files': [(rel_path, content, mode, sha256, offset_in_batch, uid, gid, mtime, owner, group_name), ...],
         'total_bytes': int}, ...]
     """
     batches = []
@@ -188,7 +206,7 @@ def _assign_batches(inventory, batch_size):
     current_bytes = 0
     batch_id = 0
 
-    for rel_path, content, mode, sha256 in inventory:
+    for rel_path, content, mode, sha256, uid, gid, mtime, owner, group_name in inventory:
         fsize = len(content)
         # Start a new batch if adding this file would exceed target
         # (unless current batch is empty — always accept at least one file).
@@ -202,7 +220,7 @@ def _assign_batches(inventory, batch_size):
             current_files = []
             current_bytes = 0
 
-        current_files.append((rel_path, content, mode, sha256, current_bytes))
+        current_files.append((rel_path, content, mode, sha256, current_bytes, uid, gid, mtime, owner, group_name))
         current_bytes += fsize
 
     # Finalize last batch
@@ -282,9 +300,9 @@ def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
     if parallel <= 1:
         inventory = []
         for file_path, rel_path in sorted(file_entries, key=lambda x: x[1]):
-            content, mode, hash_hex = _read_and_hash(file_path, hash_algo)
+            content, mode, hash_hex, uid, gid, mtime, owner, group_name = _read_and_hash(file_path, hash_algo)
             bagit_path = "data/" + rel_path
-            inventory.append((bagit_path, content, mode, hash_hex))
+            inventory.append((bagit_path, content, mode, hash_hex, uid, gid, mtime, owner, group_name))
             if xattr_flag:
                 from har import _read_xattrs
                 xattrs = _read_xattrs(file_path)
@@ -302,9 +320,9 @@ def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
             futures = [executor.submit(_read_and_hash, fp, hash_algo) for fp, _ in sorted_entries]
             inventory = []
             for (file_path, rel_path), future in zip(sorted_entries, futures):
-                content, mode, hash_hex = future.result()
+                content, mode, hash_hex, uid, gid, mtime, owner, group_name = future.result()
                 bagit_path = "data/" + rel_path
-                inventory.append((bagit_path, content, mode, hash_hex))
+                inventory.append((bagit_path, content, mode, hash_hex, uid, gid, mtime, owner, group_name))
                 if xattr_flag:
                     from har import _read_xattrs
                     xattrs = _read_xattrs(file_path)
@@ -324,10 +342,10 @@ def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
         print(f"Batches: {len(batches)} (target {_human_size(batch_size)})")
 
     # Phase 4: Build BagIt manifests
-    total_bytes = sum(len(content) for _, content, _, _ in inventory)
+    total_bytes = sum(len(content) for _, content, _, _, _, _, _, _, _ in inventory)
     file_count = len(inventory)
 
-    manifest_records = [(path, hash_hex) for path, _, _, hash_hex in inventory]
+    manifest_records = [(path, hash_hex) for path, _, _, hash_hex, _, _, _, _, _ in inventory]
     manifest_name = f'manifest-{hash_algo}.txt'
     tagmanifest_name = f'tagmanifest-{hash_algo}.txt'
     bagit_txt = _generate_bagit_txt()
@@ -350,13 +368,18 @@ def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
         index_arr = np.zeros(file_count, dtype=INDEX_DTYPE)
         i = 0
         for batch in batches:
-            for rel_path, content, mode, sha256, offset in batch['files']:
+            for rel_path, content, mode, sha256, offset, uid, gid, mtime, owner, group_name in batch['files']:
                 index_arr[i]['path'] = rel_path.encode('utf-8')
                 index_arr[i]['batch_id'] = batch['id']
                 index_arr[i]['offset'] = offset
                 index_arr[i]['length'] = len(content)
                 index_arr[i]['mode'] = mode
                 index_arr[i]['sha256'] = sha256.encode('ascii')
+                index_arr[i]['uid'] = uid
+                index_arr[i]['gid'] = gid
+                index_arr[i]['mtime'] = mtime
+                index_arr[i]['owner'] = owner.encode('utf-8')
+                index_arr[i]['group_name'] = group_name.encode('utf-8')
                 i += 1
 
         h5f.create_dataset('index', data=index_arr, compression='gzip',
@@ -366,7 +389,7 @@ def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
         batches_grp = h5f.create_group('batches')
         for batch in batches:
             buf = bytearray(batch['total_bytes'])
-            for _, content, _, _, offset in batch['files']:
+            for _, content, _, _, offset, _, _, _, _, _ in batch['files']:
                 buf[offset:offset + len(content)] = content
             ds_kwargs = {}
             if compression:

@@ -19,6 +19,10 @@ struct Cli {
     #[arg(short = 't', group = "operation")]
     list: bool,
 
+    /// Browse archive interactively (TUI)
+    #[arg(short = 'b', long = "browse", group = "operation")]
+    browse: bool,
+
     /// HDF5 archive file
     #[arg(short = 'f', long = "file", required = true)]
     file: String,
@@ -98,6 +102,12 @@ fn main() {
     if cli.parallel < 1 {
         eprintln!("Error: --parallel must be >= 1.");
         std::process::exit(1);
+    }
+
+    // --- Browse mode ---
+    if cli.browse {
+        har::browse::browse_archive(&cli.file);
+        return;
     }
 
     // Determine compression settings

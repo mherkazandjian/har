@@ -108,8 +108,21 @@ def _read_file(file_path):
     """Read a file's bytes and permission mode. Unit of work for ThreadPoolExecutor."""
     with open(file_path, 'rb') as fobj:
         content = fobj.read()
-    mode = os.stat(file_path).st_mode
-    return content, mode
+    st = os.stat(file_path)
+    mode = st.st_mode
+    uid = st.st_uid
+    gid = st.st_gid
+    mtime = st.st_mtime
+    import pwd, grp as grp_mod
+    try:
+        owner = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        owner = str(uid)
+    try:
+        group = grp_mod.getgrgid(gid).gr_name
+    except KeyError:
+        group = str(gid)
+    return content, mode, uid, gid, owner, group, mtime
 
 
 def _write_extracted_file(args):
@@ -294,7 +307,9 @@ def pack_or_append_to_h5(sources,
     progress = ProgressBar(len(file_entries) if verbose else 0)
     verbose_file = verbose and not progress.is_tty
 
-    def _write_to_h5(h5fobj, rel_path, content, mode, create_groups=True, src_path=None):
+    def _write_to_h5(h5fobj, rel_path, content, mode, uid=0, gid=0,
+                     owner='', group='', mtime=0.0,
+                     create_groups=True, src_path=None):
         """Write a single file's data to the HDF5 archive."""
         if verbose_file:
             print("Storing:", rel_path)
@@ -316,6 +331,11 @@ def pack_or_append_to_h5(sources,
             shuffle=shuffle
         )
         ds.attrs['mode'] = mode
+        ds.attrs['uid'] = np.uint32(uid)
+        ds.attrs['gid'] = np.uint32(gid)
+        ds.attrs['owner'] = owner
+        ds.attrs['group'] = group
+        ds.attrs['mtime'] = mtime
         if checksum:
             ds.attrs['har_checksum'] = compute_checksum(content, checksum)
             ds.attrs['har_checksum_algo'] = checksum
@@ -328,8 +348,10 @@ def pack_or_append_to_h5(sources,
         # Sequential path: read and write one file at a time (no extra memory).
         with h5py.File(output_h5, file_mode) as h5fobj:
             for file_path, rel_path in file_entries:
-                content, mode = _read_file(file_path)
-                _write_to_h5(h5fobj, rel_path, content, mode, src_path=file_path)
+                content, mode, uid, gid, owner, group, mtime = _read_file(file_path)
+                _write_to_h5(h5fobj, rel_path, content, mode,
+                             uid=uid, gid=gid, owner=owner, group=group, mtime=mtime,
+                             src_path=file_path)
                 progress.update(rel_path)
             for rel_dir in empty_dirs:
                 grp = h5fobj.require_group(rel_dir)
@@ -351,15 +373,17 @@ def pack_or_append_to_h5(sources,
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
             futures = [executor.submit(_read_file, fp) for fp, _ in file_entries]
             for (file_path, rel_path), future in zip(file_entries, futures):
-                content, mode = future.result()
-                read_results.append((rel_path, content, mode, file_path))
+                content, mode, uid, gid, owner, group, mtime = future.result()
+                read_results.append((rel_path, content, mode, uid, gid, owner, group, mtime, file_path))
 
         # Phase 3: Serial HDF5 writes (no thread pool overhead, no require_group).
         with h5py.File(output_h5, file_mode) as h5fobj:
             for g in sorted(all_groups):
                 h5fobj.require_group(g)
-            for rel_path, content, mode, src_path in read_results:
-                _write_to_h5(h5fobj, rel_path, content, mode, create_groups=False, src_path=src_path)
+            for rel_path, content, mode, uid, gid, owner, group, mtime, src_path in read_results:
+                _write_to_h5(h5fobj, rel_path, content, mode,
+                             uid=uid, gid=gid, owner=owner, group=group, mtime=mtime,
+                             create_groups=False, src_path=src_path)
                 progress.update(rel_path)
             for rel_dir in empty_dirs:
                 grp = h5fobj.require_group(rel_dir)
@@ -562,6 +586,7 @@ def main():
     group.add_argument("-r", action="store_true", help="Append one or more directories/files to an existing archive.")
     group.add_argument("-x", action="store_true", help="Extract from an archive.")
     group.add_argument("-t", action="store_true", help="List contents of an archive.")
+    group.add_argument("-b", "--browse", action="store_true", help="Browse archive interactively (TUI).")
 
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbosely list files processed.")
 
@@ -657,6 +682,12 @@ def main():
         compression = 'lzma'
     else:
         pass
+
+    # --- Browse mode ---
+    if args.browse:
+        from har_browse import browse_archive
+        browse_archive(h5_file)
+        return
 
     # --- BagIt mode dispatch ---
     if args.bagit or args.mpi:

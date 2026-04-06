@@ -139,6 +139,7 @@ bench_*.h5
 # Rust
 ## Build artifacts
 src/rust/target/
+src/rust/target_check/
 src/rust/har-rust
 src/rust/har-rust-static
 **/*.rs.bk

@@ -17,20 +17,32 @@ DOCKER_IMAGE := har-rust-build
 DOCKER_IMAGE_STATIC := har-rust-build-static
 
 ifeq ($(container),apptainer)
+  DYNAMIC_TARGET := /tmp/har_target
+  STATIC_TARGET  := /tmp/har_static_target
   RUN_DYNAMIC := apptainer exec \
       --bind $(RUST_DIR):/work \
-      --env CARGO_HOME=/work/.cargo_home \
+      --bind /tmp/har_cargo_home:/tmp/cargo_home \
+      --bind $(DYNAMIC_TARGET):/tmp/target_dir \
+      --env CARGO_HOME=/tmp/cargo_home \
+      --env CARGO_TARGET_DIR=/tmp/target_dir \
       --env HDF5_DIR=/usr/lib/x86_64-linux-gnu/hdf5/serial \
       $(RUST_SANDBOX) bash -c
   RUN_STATIC := apptainer exec \
       --bind $(RUST_DIR):/work \
-      --env CARGO_HOME=/work/.cargo_home \
+      --bind /tmp/har_static_cargo:/tmp/cargo_home \
+      --bind $(STATIC_TARGET):/tmp/target_dir \
+      --env CARGO_HOME=/tmp/cargo_home \
+      --env CARGO_TARGET_DIR=/tmp/target_dir \
       --env RUSTUP_HOME=/work/.rustup_home \
       $(RUST_STATIC_SANDBOX) bash -c
   WORKDIR := /work
   NEED_DYNAMIC_ENV := rust-sandbox-apptainer
   NEED_STATIC_ENV := rust-static-sandbox-apptainer
+  ENSURE_DYNAMIC_DIRS := @mkdir -p /tmp/har_cargo_home $(DYNAMIC_TARGET)
+  ENSURE_STATIC_DIRS  := @mkdir -p /tmp/har_static_cargo $(STATIC_TARGET)
 else ifeq ($(container),docker)
+  DYNAMIC_TARGET := $(RUST_DIR)/target
+  STATIC_TARGET  := $(RUST_DIR)/target
   RUN_DYNAMIC := docker run --rm \
       -v $(RUST_DIR):/work \
       -e CARGO_HOME=/work/.cargo_home \
@@ -43,12 +55,18 @@ else ifeq ($(container),docker)
   WORKDIR := /work
   NEED_DYNAMIC_ENV := rust-sandbox-docker
   NEED_STATIC_ENV := rust-static-sandbox-docker
+  ENSURE_DYNAMIC_DIRS :=
+  ENSURE_STATIC_DIRS  :=
 else ifeq ($(container),native)
+  DYNAMIC_TARGET := $(RUST_DIR)/target
+  STATIC_TARGET  := $(RUST_DIR)/target
   RUN_DYNAMIC := bash -c
   RUN_STATIC := bash -c
   WORKDIR := $(RUST_DIR)
   NEED_DYNAMIC_ENV :=
   NEED_STATIC_ENV :=
+  ENSURE_DYNAMIC_DIRS :=
+  ENSURE_STATIC_DIRS  :=
 else
   $(error container= must be one of: apptainer, docker, native)
 endif
@@ -188,23 +206,27 @@ rust-static-sandbox-native:
 build-rust: build-rust-release
 
 build-rust-debug: $(NEED_DYNAMIC_ENV)
+	$(ENSURE_DYNAMIC_DIRS)
 	$(RUN_DYNAMIC) "cd $(WORKDIR) && cargo build"
-	cp $(RUST_DIR)/target/debug/har $(RUST_BIN)
+	cp $(DYNAMIC_TARGET)/debug/har $(RUST_BIN)
 	@echo "Built: $(RUST_BIN) (debug, dynamic, $(container))"
 
 build-rust-release: $(NEED_DYNAMIC_ENV)
+	$(ENSURE_DYNAMIC_DIRS)
 	$(RUN_DYNAMIC) "cd $(WORKDIR) && cargo build --release"
-	cp $(RUST_DIR)/target/release/har $(RUST_BIN)
+	cp $(DYNAMIC_TARGET)/release/har $(RUST_BIN)
 	@echo "Built: $(RUST_BIN) (release, dynamic, $(container))"
 
 build-rust-static: $(NEED_STATIC_ENV)
+	$(ENSURE_STATIC_DIRS)
 	$(RUN_STATIC) "cd $(WORKDIR) && RUSTFLAGS='-C target-feature=+crt-static' cargo build --features static-hdf5 --target x86_64-unknown-linux-musl"
-	cp $(RUST_DIR)/target/x86_64-unknown-linux-musl/debug/har $(RUST_BIN_STATIC)
+	cp $(STATIC_TARGET)/x86_64-unknown-linux-musl/debug/har $(RUST_BIN_STATIC)
 	@echo "Built: $(RUST_BIN_STATIC) (debug, static, $(container))"
 
 build-rust-release-static: $(NEED_STATIC_ENV)
+	$(ENSURE_STATIC_DIRS)
 	$(RUN_STATIC) "cd $(WORKDIR) && RUSTFLAGS='-C target-feature=+crt-static' cargo build --features static-hdf5 --release --target x86_64-unknown-linux-musl"
-	cp $(RUST_DIR)/target/x86_64-unknown-linux-musl/release/har $(RUST_BIN_STATIC)
+	cp $(STATIC_TARGET)/x86_64-unknown-linux-musl/release/har $(RUST_BIN_STATIC)
 	@echo "Built: $(RUST_BIN_STATIC) (release, static, $(container))"
 
 # ---------------------------------------------------------------------------
@@ -212,11 +234,13 @@ build-rust-release-static: $(NEED_STATIC_ENV)
 # ---------------------------------------------------------------------------
 
 test-rust: $(NEED_DYNAMIC_ENV)
+	$(ENSURE_DYNAMIC_DIRS)
 	$(RUN_DYNAMIC) "cd $(WORKDIR) && cargo test"
 
 lint: lint-rust lint-python
 
 lint-rust: $(NEED_DYNAMIC_ENV)
+	$(ENSURE_DYNAMIC_DIRS)
 	$(RUN_DYNAMIC) "cd $(WORKDIR) && cargo clippy -- -D warnings"
 
 lint-python:
