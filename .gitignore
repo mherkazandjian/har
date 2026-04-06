@@ -152,6 +152,7 @@ src/rust/.rustup_home/
 
 ## Sandbox / container
 src/rust/rust_sandbox/
+src/rust/rust_static_sandbox/
 src/rust/*.sif
 
 ## Debug / profiling

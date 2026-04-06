@@ -7,20 +7,57 @@ RUST_STATIC_SANDBOX := $(RUST_DIR)/rust_static_sandbox
 RUST_BIN := $(RUST_DIR)/har-rust
 RUST_BIN_STATIC := $(RUST_DIR)/har-rust-static
 
-APPTAINER_RUN := apptainer exec \
-	--bind $(RUST_DIR):/work \
-	--env CARGO_HOME=/work/.cargo_home \
-	--env HDF5_DIR=/usr/lib/x86_64-linux-gnu/hdf5/serial \
-	$(RUST_SANDBOX) bash -c
+# ---------------------------------------------------------------------------
+# Container backend: apptainer (default) | docker | native
+# Usage: make build-rust-release container=docker
+# ---------------------------------------------------------------------------
+container ?= apptainer
 
-APPTAINER_RUN_STATIC := apptainer exec \
-	--bind $(RUST_DIR):/work \
-	--env CARGO_HOME=/work/.cargo_home \
-	--env RUSTUP_HOME=/work/.rustup_home \
-	$(RUST_STATIC_SANDBOX) bash -c
+DOCKER_IMAGE := har-rust-build
+DOCKER_IMAGE_STATIC := har-rust-build-static
 
-.PHONY: nothing all clean test test-python test-rust help \
+ifeq ($(container),apptainer)
+  RUN_DYNAMIC := apptainer exec \
+      --bind $(RUST_DIR):/work \
+      --env CARGO_HOME=/work/.cargo_home \
+      --env HDF5_DIR=/usr/lib/x86_64-linux-gnu/hdf5/serial \
+      $(RUST_SANDBOX) bash -c
+  RUN_STATIC := apptainer exec \
+      --bind $(RUST_DIR):/work \
+      --env CARGO_HOME=/work/.cargo_home \
+      --env RUSTUP_HOME=/work/.rustup_home \
+      $(RUST_STATIC_SANDBOX) bash -c
+  WORKDIR := /work
+  NEED_DYNAMIC_ENV := rust-sandbox-apptainer
+  NEED_STATIC_ENV := rust-static-sandbox-apptainer
+else ifeq ($(container),docker)
+  RUN_DYNAMIC := docker run --rm \
+      -v $(RUST_DIR):/work \
+      -e CARGO_HOME=/work/.cargo_home \
+      -e HDF5_DIR=/usr/lib/x86_64-linux-gnu/hdf5/serial \
+      $(DOCKER_IMAGE) bash -c
+  RUN_STATIC := docker run --rm \
+      -v $(RUST_DIR):/work \
+      -e CARGO_HOME=/work/.cargo_home \
+      -e RUSTUP_HOME=/work/.rustup_home \
+      $(DOCKER_IMAGE_STATIC) bash -c
+  WORKDIR := /work
+  NEED_DYNAMIC_ENV := rust-sandbox-docker
+  NEED_STATIC_ENV := rust-static-sandbox-docker
+else ifeq ($(container),native)
+  RUN_DYNAMIC := bash -c
+  RUN_STATIC := bash -c
+  WORKDIR := $(RUST_DIR)
+  NEED_DYNAMIC_ENV :=
+  NEED_STATIC_ENV :=
+else
+  $(error container= must be one of: apptainer, docker, native)
+endif
+
+.PHONY: nothing all clean test test-python test-bagit test-mpi test-rust help \
 	rust-sandbox rust-static-sandbox \
+	rust-sandbox-apptainer rust-sandbox-docker rust-sandbox-native \
+	rust-static-sandbox-apptainer rust-static-sandbox-docker rust-static-sandbox-native \
 	build-rust build-rust-debug build-rust-release \
 	build-rust-static build-rust-release-static \
 	clean-rust install-rust
@@ -28,6 +65,11 @@ APPTAINER_RUN_STATIC := apptainer exec \
 nothing:
 
 help:
+	@echo "Container backend (default: apptainer):"
+	@echo "  container=apptainer  - build inside Apptainer sandbox"
+	@echo "  container=docker     - build inside Docker container"
+	@echo "  container=native     - build directly on host (no container)"
+	@echo ""
 	@echo "Rust build targets:"
 	@echo "  build-rust                - alias for build-rust-release"
 	@echo "  build-rust-debug          - debug build (dynamic linking)"
@@ -35,9 +77,11 @@ help:
 	@echo "  build-rust-static         - debug build (static musl)"
 	@echo "  build-rust-release-static - release build (static musl)"
 	@echo ""
+	@echo "Rust environment setup:"
+	@echo "  rust-sandbox              - create dynamic-build environment"
+	@echo "  rust-static-sandbox       - create static/musl-build environment"
+	@echo ""
 	@echo "Rust utility targets:"
-	@echo "  rust-sandbox              - create dynamic-build sandbox"
-	@echo "  rust-static-sandbox       - create static/musl-build sandbox"
 	@echo "  test-rust                 - run Rust tests"
 	@echo "  clean-rust                - remove target/ and cargo/rustup homes"
 	@echo "  install-rust              - copy release binaries to DESTDIR"
@@ -46,6 +90,11 @@ help:
 	@echo "  test                      - run all tests"
 	@echo "  test-python               - run Python tests"
 	@echo "  clean                     - remove Python build artifacts"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make build-rust-release                        # apptainer (default)"
+	@echo "  make build-rust-release container=docker       # docker"
+	@echo "  make build-rust-release container=native       # no container"
 
 all: build-rust-release build-rust-release-static
 
@@ -77,10 +126,15 @@ test-mpi:
 	mpirun -np 4 python -m pytest tests/test_h5_mpi.py -v
 
 # ---------------------------------------------------------------------------
-# Rust sandboxes
+# Rust environment setup (dispatches to backend-specific target)
 # ---------------------------------------------------------------------------
 
-rust-sandbox:
+rust-sandbox: rust-sandbox-$(container)
+rust-static-sandbox: rust-static-sandbox-$(container)
+
+# --- Apptainer sandboxes ---
+
+rust-sandbox-apptainer:
 	@if [ ! -d "$(RUST_SANDBOX)" ]; then \
 		echo "Building Rust Apptainer sandbox (glibc/dynamic)..."; \
 		cd $(RUST_DIR) && apptainer build --fakeroot --sandbox rust_sandbox docker://rust:1.86-bookworm; \
@@ -90,7 +144,7 @@ rust-sandbox:
 		echo "Rust sandbox already exists."; \
 	fi
 
-rust-static-sandbox:
+rust-static-sandbox-apptainer:
 	@if [ ! -d "$(RUST_STATIC_SANDBOX)" ]; then \
 		echo "Building Rust Apptainer sandbox (musl/static)..."; \
 		cd $(RUST_DIR) && apptainer build --fakeroot --sandbox rust_static_sandbox docker://rust:1.86-alpine; \
@@ -100,38 +154,66 @@ rust-static-sandbox:
 		echo "Rust static sandbox already exists."; \
 	fi
 
+# --- Docker images ---
+
+rust-sandbox-docker:
+	@if ! docker image inspect $(DOCKER_IMAGE) >/dev/null 2>&1; then \
+		echo "Building Docker image $(DOCKER_IMAGE) (glibc/dynamic)..."; \
+		printf 'FROM rust:1.86-bookworm\nRUN apt-get update && apt-get install -y libhdf5-dev pkg-config cmake && rm -rf /var/lib/apt/lists/*\nWORKDIR /work\n' \
+			| docker build -t $(DOCKER_IMAGE) -; \
+	else \
+		echo "Docker image $(DOCKER_IMAGE) already exists."; \
+	fi
+
+rust-static-sandbox-docker:
+	@if ! docker image inspect $(DOCKER_IMAGE_STATIC) >/dev/null 2>&1; then \
+		echo "Building Docker image $(DOCKER_IMAGE_STATIC) (musl/static)..."; \
+		printf 'FROM rust:1.86-alpine\nRUN apk add --no-cache hdf5-dev hdf5-static musl-dev pkgconf cmake make perl zlib-static && rustup target add x86_64-unknown-linux-musl\nWORKDIR /work\n' \
+			| docker build -t $(DOCKER_IMAGE_STATIC) -; \
+	else \
+		echo "Docker image $(DOCKER_IMAGE_STATIC) already exists."; \
+	fi
+
+# --- Native (no-op) ---
+
+rust-sandbox-native:
+	@echo "Native mode: no container (ensure libhdf5-dev, pkg-config, cmake, cargo are installed)"
+
+rust-static-sandbox-native:
+	@echo "Native mode: no container (ensure hdf5-dev, hdf5-static, musl target are installed)"
+
 # ---------------------------------------------------------------------------
 # Rust builds
 # ---------------------------------------------------------------------------
 
 build-rust: build-rust-release
 
-build-rust-debug: rust-sandbox
-	$(APPTAINER_RUN) "cd /work && cargo build"
+build-rust-debug: $(NEED_DYNAMIC_ENV)
+	$(RUN_DYNAMIC) "cd $(WORKDIR) && cargo build"
 	cp $(RUST_DIR)/target/debug/har $(RUST_BIN)
-	@echo "Built: $(RUST_BIN) (debug, dynamic)"
+	@echo "Built: $(RUST_BIN) (debug, dynamic, $(container))"
 
-build-rust-release: rust-sandbox
-	$(APPTAINER_RUN) "cd /work && cargo build --release"
+build-rust-release: $(NEED_DYNAMIC_ENV)
+	$(RUN_DYNAMIC) "cd $(WORKDIR) && cargo build --release"
 	cp $(RUST_DIR)/target/release/har $(RUST_BIN)
-	@echo "Built: $(RUST_BIN) (release, dynamic)"
+	@echo "Built: $(RUST_BIN) (release, dynamic, $(container))"
 
-build-rust-static: rust-static-sandbox
-	$(APPTAINER_RUN_STATIC) "cd /work && RUSTFLAGS='-C target-feature=+crt-static' cargo build --target x86_64-unknown-linux-musl"
+build-rust-static: $(NEED_STATIC_ENV)
+	$(RUN_STATIC) "cd $(WORKDIR) && RUSTFLAGS='-C target-feature=+crt-static' cargo build --target x86_64-unknown-linux-musl"
 	cp $(RUST_DIR)/target/x86_64-unknown-linux-musl/debug/har $(RUST_BIN_STATIC)
-	@echo "Built: $(RUST_BIN_STATIC) (debug, static)"
+	@echo "Built: $(RUST_BIN_STATIC) (debug, static, $(container))"
 
-build-rust-release-static: rust-static-sandbox
-	$(APPTAINER_RUN_STATIC) "cd /work && RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target x86_64-unknown-linux-musl"
+build-rust-release-static: $(NEED_STATIC_ENV)
+	$(RUN_STATIC) "cd $(WORKDIR) && RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target x86_64-unknown-linux-musl"
 	cp $(RUST_DIR)/target/x86_64-unknown-linux-musl/release/har $(RUST_BIN_STATIC)
-	@echo "Built: $(RUST_BIN_STATIC) (release, static)"
+	@echo "Built: $(RUST_BIN_STATIC) (release, static, $(container))"
 
 # ---------------------------------------------------------------------------
 # Rust utility
 # ---------------------------------------------------------------------------
 
-test-rust: rust-sandbox
-	$(APPTAINER_RUN) "cd /work && cargo test"
+test-rust: $(NEED_DYNAMIC_ENV)
+	$(RUN_DYNAMIC) "cd $(WORKDIR) && cargo test"
 
 clean-rust:
 	rm -rf $(RUST_DIR)/target $(RUST_DIR)/.cargo_home $(RUST_DIR)/.rustup_home
