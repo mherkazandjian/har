@@ -42,9 +42,23 @@ import os
 import sys
 import argparse
 import concurrent.futures
+import hashlib
 import h5py
 import numpy as np
 import time
+
+
+def compute_checksum(data, algo):
+    """Compute a hex digest using the specified algorithm."""
+    if algo == 'md5':
+        return hashlib.md5(data).hexdigest()
+    elif algo == 'sha256':
+        return hashlib.sha256(data).hexdigest()
+    elif algo == 'blake3':
+        import blake3
+        return blake3.blake3(data).hexdigest()
+    else:
+        raise ValueError(f"Unsupported checksum algorithm: {algo}")
 
 
 def _read_file(file_path):
@@ -79,7 +93,8 @@ def pack_or_append_to_h5(sources,
                          compression_opts=None,
                          shuffle=False,
                          parallel=1,
-                         verbose=False):
+                         verbose=False,
+                         checksum=None):
     """
     Archive or append the given sources (directories and/or files) into the HDF5 archive.
 
@@ -91,6 +106,7 @@ def pack_or_append_to_h5(sources,
     :param shuffle: Whether to use the shuffle filter.
     :param parallel: Number of parallel workers for file reads (default: 1).
     :param verbose: Print filenames as they are processed (default: False).
+    :param checksum: Checksum algorithm (md5, sha256, blake3) or None.
     """
     output_h5 = os.path.expanduser(output_h5)
     t0 = time.time()
@@ -139,6 +155,9 @@ def pack_or_append_to_h5(sources,
             shuffle=shuffle
         )
         ds.attrs['mode'] = mode
+        if checksum:
+            ds.attrs['har_checksum'] = compute_checksum(content, checksum)
+            ds.attrs['har_checksum_algo'] = checksum
 
     if parallel <= 1:
         # Sequential path: read and write one file at a time (no extra memory).
@@ -184,7 +203,7 @@ def pack_or_append_to_h5(sources,
     print(f"\nOperation completed in {t1 - t0:.2f} seconds.")
 
 def extract_h5_to_directory(h5_path, extract_dir, file_key=None, parallel=1,
-                            verbose=False):
+                            verbose=False, validate=False, checksum=None):
     """
     Extract files from an HDF5 file.
       - If file_key is None, extract the entire archive.
@@ -193,6 +212,8 @@ def extract_h5_to_directory(h5_path, extract_dir, file_key=None, parallel=1,
 
     :param parallel: Number of parallel workers for extraction (default: 1).
     :param verbose: Print filenames as they are extracted (default: False).
+    :param validate: Verify checksums on extraction (default: False).
+    :param checksum: Ignored (algo read from archive attributes).
     """
     h5_path = os.path.expanduser(h5_path)
     extract_dir = os.path.expanduser(extract_dir)
@@ -219,10 +240,18 @@ def extract_h5_to_directory(h5_path, extract_dir, file_key=None, parallel=1,
                 fout.write(file_bytes)
             if 'mode' in dataset.attrs:
                 os.chmod(dest_file_path, dataset.attrs['mode'])
+            if validate and 'har_checksum_algo' in dataset.attrs:
+                algo = dataset.attrs['har_checksum_algo']
+                stored = dataset.attrs['har_checksum']
+                actual = compute_checksum(file_bytes, algo)
+                if actual != stored:
+                    print(f"CHECKSUM MISMATCH ({algo}): {file_key}", file=sys.stderr)
+                    sys.exit(1)
             if verbose:
                 print(f"Extracted: {file_key}")
     elif parallel <= 1:
         # Sequential full extraction.
+        checksum_errors = []
         with h5fobj:
             def extract_item(name, obj):
                 if isinstance(obj, h5py.Dataset):
@@ -233,6 +262,12 @@ def extract_h5_to_directory(h5_path, extract_dir, file_key=None, parallel=1,
                         fout.write(file_bytes)
                     if 'mode' in obj.attrs:
                         os.chmod(dest_file_path, obj.attrs['mode'])
+                    if validate and 'har_checksum_algo' in obj.attrs:
+                        algo = obj.attrs['har_checksum_algo']
+                        stored = obj.attrs['har_checksum']
+                        actual = compute_checksum(file_bytes, algo)
+                        if actual != stored:
+                            checksum_errors.append(name)
                     if verbose:
                         print(f"Extracted: {name}")
                 elif isinstance(obj, h5py.Group) and obj.attrs.get('empty_dir'):
@@ -241,6 +276,13 @@ def extract_h5_to_directory(h5_path, extract_dir, file_key=None, parallel=1,
                     if verbose:
                         print(f"Created empty dir: {name}")
             h5fobj.visititems(extract_item)
+        if checksum_errors:
+            print(f"CHECKSUM MISMATCH on {len(checksum_errors)} file(s):", file=sys.stderr)
+            for e in checksum_errors[:10]:
+                print(f"  {e}", file=sys.stderr)
+            if len(checksum_errors) > 10:
+                print(f"  ... and {len(checksum_errors) - 10} more", file=sys.stderr)
+            sys.exit(1)
     else:
         # Parallel full extraction.
         # Phase 1: Bulk read all datasets from HDF5 sequentially into memory.
@@ -325,8 +367,14 @@ def main():
                         help="Use hdf5 szip compression (off by default, untested).")
     parser.add_argument("--zopt", type=str, default="9",
                         help="Compression level for gzip 1-9 (default: 9). Ignored for lzf.")
+    parser.add_argument("--lzma", action="store_true",
+                        help="Use LZMA compression (application-level, no HDF5 filter plugin needed).")
     parser.add_argument("--shuffle", action="store_true",
                         help="Use HDF5 shuffle filter before compression (off by default).")
+
+    # Checksum.
+    parser.add_argument("--checksum", choices=["md5", "sha256", "blake3"],
+                        help="Checksum algorithm for integrity verification (md5, sha256, blake3).")
 
     # Parallelism.
     parser.add_argument("-p", "--parallel", type=int, default=1,
@@ -384,6 +432,8 @@ def main():
             compression_opts = tuple(map(int, args.zopt.split(',')))
         else:
             compression_opts = (4, 4)
+    elif args.lzma:
+        compression = 'lzma'
     else:
         pass
 
@@ -436,7 +486,8 @@ def main():
                 shuffle=args.shuffle,
                 batch_size=bs,
                 parallel=args.parallel,
-                verbose=args.verbose)
+                verbose=args.verbose,
+                checksum=args.checksum)
         elif args.x:
             file_key = sources[0] if sources else None
             extract_bagit(
@@ -473,7 +524,8 @@ def main():
             file_key = sources[0] if sources else None
             extract_h5_to_directory(h5_file, target_dir, file_key=file_key,
                                     parallel=args.parallel,
-                                    verbose=args.verbose)
+                                    verbose=args.verbose,
+                                    validate=args.validate)
         else:
             list_h5_contents(h5_file)
 
@@ -491,7 +543,8 @@ def main():
             compression_opts=compression_opts,
             shuffle=args.shuffle,
             parallel=args.parallel,
-            verbose=args.verbose)
+            verbose=args.verbose,
+            checksum=args.checksum)
     elif args.r:
         # Append to archive.
         if not sources:
@@ -505,12 +558,14 @@ def main():
             compression_opts=compression_opts,
             shuffle=args.shuffle,
             parallel=args.parallel,
-            verbose=args.verbose)
+            verbose=args.verbose,
+            checksum=args.checksum)
     elif args.x:
         file_key = sources[0] if sources else None
         extract_h5_to_directory(h5_file, target_dir, file_key=file_key,
                                 parallel=args.parallel,
-                                verbose=args.verbose)
+                                verbose=args.verbose,
+                                validate=args.validate)
     elif args.t:
         list_h5_contents(h5_file)
     else:

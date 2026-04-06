@@ -75,6 +75,10 @@ struct Cli {
     #[arg(long = "bagit-raw")]
     bagit_raw: bool,
 
+    /// Checksum algorithm for integrity verification (md5, sha256, blake3)
+    #[arg(long = "checksum", value_parser = ["md5", "sha256", "blake3"])]
+    checksum: Option<String>,
+
     /// Source directories/files (for -c/-r) or file key to extract (for -x)
     #[arg(trailing_var_arg = true)]
     path: Vec<String>,
@@ -103,6 +107,8 @@ fn main() {
         (None, None)
     };
 
+    let checksum = cli.checksum.as_deref();
+
     // --- BagIt mode ---
     if cli.bagit {
         let bs = har::bagit::parse_batch_size(&cli.batch_size);
@@ -120,7 +126,7 @@ fn main() {
             let sources: Vec<&str> = cli.path.iter().map(|s| s.as_str()).collect();
             har::bagit::pack_bagit(
                 &sources, &cli.file, compression, compression_opts,
-                cli.shuffle, bs, cli.parallel, cli.verbose,
+                cli.shuffle, bs, cli.parallel, cli.verbose, checksum,
             );
         } else if cli.extract {
             let file_key = if cli.path.is_empty() { None } else { Some(cli.path[0].as_str()) };
@@ -158,7 +164,7 @@ fn main() {
         let sources: Vec<&str> = cli.path.iter().map(|s| s.as_str()).collect();
         har::pack_or_append_to_h5(
             &sources, &cli.file, "w", compression, compression_opts,
-            cli.shuffle, cli.parallel, cli.verbose,
+            cli.shuffle, cli.parallel, cli.verbose, checksum,
         );
     } else if cli.append {
         if cli.path.is_empty() {
@@ -168,12 +174,13 @@ fn main() {
         let sources: Vec<&str> = cli.path.iter().map(|s| s.as_str()).collect();
         har::pack_or_append_to_h5(
             &sources, &cli.file, "a", compression, compression_opts,
-            cli.shuffle, cli.parallel, cli.verbose,
+            cli.shuffle, cli.parallel, cli.verbose, checksum,
         );
     } else if cli.extract {
         let file_key = if cli.path.is_empty() { None } else { Some(cli.path[0].as_str()) };
         har::extract_h5_to_directory(
             &cli.file, &cli.directory, file_key, cli.parallel, cli.verbose,
+            cli.validate, checksum,
         );
     } else if cli.list {
         har::list_h5_contents(&cli.file);

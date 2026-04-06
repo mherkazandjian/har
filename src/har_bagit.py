@@ -16,6 +16,20 @@ import concurrent.futures
 import h5py
 import numpy as np
 
+
+
+def compute_checksum(data, algo):
+    """Compute a hex digest using the specified algorithm."""
+    if algo == 'md5':
+        return hashlib.md5(data).hexdigest()
+    elif algo == 'sha256':
+        return hashlib.sha256(data).hexdigest()
+    elif algo == 'blake3':
+        import blake3
+        return blake3.blake3(data).hexdigest()
+    else:
+        raise ValueError(f"Unsupported checksum algorithm: {algo}")
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -58,18 +72,18 @@ def _human_size(nbytes):
     return f"{nbytes:.1f} PB"
 
 
-def _read_and_hash(file_path):
-    """Read file bytes, compute SHA-256, return (content, mode, sha256_hex)."""
+def _read_and_hash(file_path, algo='sha256'):
+    """Read file bytes, compute checksum, return (content, mode, hash_hex)."""
     with open(file_path, 'rb') as f:
         content = f.read()
     mode = os.stat(file_path).st_mode
-    sha256_hex = hashlib.sha256(content).hexdigest()
-    return content, mode, sha256_hex
+    hash_hex = compute_checksum(content, algo)
+    return content, mode, hash_hex
 
 
-def _sha256_bytes(data):
-    """SHA-256 hex digest of a bytes object."""
-    return hashlib.sha256(data).hexdigest()
+def _checksum_bytes(data, algo='sha256'):
+    """Hex digest of a bytes object using the specified algorithm."""
+    return compute_checksum(data, algo)
 
 
 def build_inventory(sources):
@@ -190,12 +204,12 @@ def _generate_manifest(index_records):
     return ("\n".join(lines) + "\n").encode('utf-8')
 
 
-def _generate_tagmanifest(tag_files):
-    """Generate tagmanifest-sha256.txt from dict of {filename: bytes_content}."""
+def _generate_tagmanifest(tag_files, algo='sha256'):
+    """Generate tagmanifest-{algo}.txt from dict of {filename: bytes_content}."""
     lines = []
     for name in sorted(tag_files):
-        sha = _sha256_bytes(tag_files[name])
-        lines.append(f"{sha}  {name}")
+        h = _checksum_bytes(tag_files[name], algo)
+        lines.append(f"{h}  {name}")
     return ("\n".join(lines) + "\n").encode('utf-8')
 
 
@@ -205,34 +219,35 @@ def _generate_tagmanifest(tag_files):
 
 def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
                shuffle=False, batch_size=DEFAULT_BATCH_SIZE, parallel=1,
-               verbose=False):
+               verbose=False, checksum=None):
     """Create a BagIt-mode HDF5 archive with batched storage."""
     output_h5 = os.path.expanduser(output_h5)
     t0 = time.time()
+    hash_algo = checksum or 'sha256'
 
     # Phase 1: Inventory
     file_entries, empty_dirs = build_inventory(sources)
     if verbose:
         print(f"Inventory: {len(file_entries)} files, {len(empty_dirs)} empty dirs")
 
-    # Phase 2: Read + SHA-256 (parallelizable)
+    # Phase 2: Read + checksum (parallelizable)
     if parallel <= 1:
         inventory = []
         for file_path, rel_path in sorted(file_entries, key=lambda x: x[1]):
-            content, mode, sha256 = _read_and_hash(file_path)
+            content, mode, hash_hex = _read_and_hash(file_path, hash_algo)
             bagit_path = "data/" + rel_path
-            inventory.append((bagit_path, content, mode, sha256))
+            inventory.append((bagit_path, content, mode, hash_hex))
             if verbose:
                 print(f"  Read: {rel_path}")
     else:
         sorted_entries = sorted(file_entries, key=lambda x: x[1])
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
-            futures = [executor.submit(_read_and_hash, fp) for fp, _ in sorted_entries]
+            futures = [executor.submit(_read_and_hash, fp, hash_algo) for fp, _ in sorted_entries]
             inventory = []
             for (_, rel_path), future in zip(sorted_entries, futures):
-                content, mode, sha256 = future.result()
+                content, mode, hash_hex = future.result()
                 bagit_path = "data/" + rel_path
-                inventory.append((bagit_path, content, mode, sha256))
+                inventory.append((bagit_path, content, mode, hash_hex))
                 if verbose:
                     print(f"  Read: {rel_path}")
 
@@ -245,21 +260,24 @@ def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
     total_bytes = sum(len(content) for _, content, _, _ in inventory)
     file_count = len(inventory)
 
-    manifest_records = [(path, sha256) for path, _, _, sha256 in inventory]
+    manifest_records = [(path, hash_hex) for path, _, _, hash_hex in inventory]
+    manifest_name = f'manifest-{hash_algo}.txt'
+    tagmanifest_name = f'tagmanifest-{hash_algo}.txt'
     bagit_txt = _generate_bagit_txt()
     bag_info_txt = _generate_bag_info(total_bytes, file_count)
     manifest_txt = _generate_manifest(manifest_records)
     tagmanifest_txt = _generate_tagmanifest({
         'bagit.txt': bagit_txt,
         'bag-info.txt': bag_info_txt,
-        'manifest-sha256.txt': manifest_txt,
-    })
+        manifest_name: manifest_txt,
+    }, hash_algo)
 
     # Phase 5: Write HDF5
     with h5py.File(output_h5, 'w') as h5f:
         # Root attributes
         h5f.attrs[HAR_FORMAT_ATTR] = HAR_FORMAT_VALUE
         h5f.attrs[HAR_VERSION_ATTR] = HAR_VERSION_VALUE
+        h5f.attrs['har_checksum_algo'] = hash_algo
 
         # Index dataset
         index_arr = np.zeros(file_count, dtype=INDEX_DTYPE)
@@ -302,8 +320,8 @@ def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
         bagit_grp = h5f.create_group('bagit')
         for name, content in [('bagit.txt', bagit_txt),
                               ('bag-info.txt', bag_info_txt),
-                              ('manifest-sha256.txt', manifest_txt),
-                              ('tagmanifest-sha256.txt', tagmanifest_txt)]:
+                              (manifest_name, manifest_txt),
+                              (tagmanifest_name, tagmanifest_txt)]:
             bagit_grp.create_dataset(
                 name, data=np.frombuffer(content, dtype=np.uint8), dtype=np.uint8)
 
@@ -349,6 +367,9 @@ def extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
                   file=sys.stderr)
             sys.exit(1)
 
+        # Read checksum algorithm from archive (defaults to sha256)
+        hash_algo = h5f.attrs.get('har_checksum_algo', 'sha256')
+
         # Read index
         index = h5f['index'][()]
 
@@ -388,7 +409,7 @@ def extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
             if mode:
                 os.chmod(dest, mode)
             if validate:
-                actual = _sha256_bytes(file_bytes)
+                actual = _checksum_bytes(file_bytes, hash_algo)
                 if actual != sha256:
                     print(f"CHECKSUM MISMATCH: {out_path}", file=sys.stderr)
                     sys.exit(1)
@@ -429,7 +450,7 @@ def extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
                 if mode:
                     os.chmod(dest, mode)
                 if validate:
-                    actual = _sha256_bytes(file_bytes)
+                    actual = _checksum_bytes(file_bytes, hash_algo)
                     if actual != sha256:
                         errors.append(out_path)
                 if verbose:
@@ -463,7 +484,7 @@ def extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
                         path = rec['path'].decode('utf-8')
                         out_path = path if bagit_raw else path.removeprefix('data/')
                         file_bytes = batch_data[offset:offset + length].tobytes()
-                        actual = _sha256_bytes(file_bytes)
+                        actual = _checksum_bytes(file_bytes, hash_algo)
                         if actual != sha256:
                             errors.append(out_path)
 

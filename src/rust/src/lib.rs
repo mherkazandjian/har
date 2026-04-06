@@ -1,4 +1,5 @@
 use rayon::prelude::*;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -27,6 +28,28 @@ pub fn lzma_decompress(data: &[u8]) -> Vec<u8> {
     )
     .expect("LZMA decompression failed");
     out
+}
+
+/// Compute a hex digest using the specified algorithm.
+pub fn compute_checksum(data: &[u8], algo: &str) -> String {
+    match algo {
+        "md5" => {
+            use md5::Md5;
+            let mut hasher = Md5::new();
+            hasher.update(data);
+            format!("{:x}", hasher.finalize())
+        }
+        "sha256" => {
+            let mut hasher = Sha256::new();
+            hasher.update(data);
+            format!("{:x}", hasher.finalize())
+        }
+        "blake3" => {
+            let hash = blake3::hash(data);
+            hash.to_hex().to_string()
+        }
+        _ => panic!("Unsupported checksum algorithm: {}", algo),
+    }
 }
 
 /// Entry collected during the inventory phase.
@@ -111,6 +134,7 @@ fn create_dataset(
     compression: Option<&str>,
     compression_opts: Option<u8>,
     shuffle: bool,
+    checksum: Option<&str>,
 ) -> hdf5::Dataset {
     let is_lzma = compression == Some("lzma");
     let write_data;
@@ -154,6 +178,22 @@ fn create_dataset(
             .expect("Failed to write har_lzma attr");
     }
 
+    if let Some(algo) = checksum {
+        let hash = compute_checksum(content, algo);
+        ds.new_attr::<hdf5::types::VarLenUnicode>()
+            .shape(())
+            .create("har_checksum")
+            .unwrap()
+            .write_scalar(&hash.parse::<hdf5::types::VarLenUnicode>().unwrap())
+            .unwrap();
+        ds.new_attr::<hdf5::types::VarLenUnicode>()
+            .shape(())
+            .create("har_checksum_algo")
+            .unwrap()
+            .write_scalar(&algo.parse::<hdf5::types::VarLenUnicode>().unwrap())
+            .unwrap();
+    }
+
     ds
 }
 
@@ -169,6 +209,7 @@ pub fn pack_or_append_to_h5(
     shuffle: bool,
     parallel: usize,
     verbose: bool,
+    checksum: Option<&str>,
 ) {
     let output_h5 = shellexpand::tilde(output_h5).to_string();
     let t0 = Instant::now();
@@ -268,7 +309,7 @@ pub fn pack_or_append_to_h5(
                     }
                 }
             }
-            let ds = create_dataset(h5f, rel_path, content, compression, compression_opts, shuffle);
+            let ds = create_dataset(h5f, rel_path, content, compression, compression_opts, shuffle, checksum);
             ds.new_attr::<u32>()
                 .shape(())
                 .create("mode")
@@ -388,12 +429,36 @@ fn collect_items(h5f: &hdf5::File) -> Vec<(String, H5ObjType)> {
 }
 
 /// Extract files from an HDF5 archive.
+/// Verify a dataset's checksum if stored. Returns true if ok or no checksum stored.
+fn verify_dataset_checksum(ds: &hdf5::Dataset, content: &[u8], name: &str) -> bool {
+    let algo = ds
+        .attr("har_checksum_algo")
+        .ok()
+        .and_then(|a| a.read_scalar::<hdf5::types::VarLenUnicode>().ok())
+        .map(|v| v.as_str().to_string());
+    let stored = ds
+        .attr("har_checksum")
+        .ok()
+        .and_then(|a| a.read_scalar::<hdf5::types::VarLenUnicode>().ok())
+        .map(|v| v.as_str().to_string());
+    if let (Some(algo), Some(stored)) = (algo, stored) {
+        let actual = compute_checksum(content, &algo);
+        if actual != stored {
+            eprintln!("CHECKSUM MISMATCH ({}): {} (expected {}, got {})", algo, name, stored, actual);
+            return false;
+        }
+    }
+    true
+}
+
 pub fn extract_h5_to_directory(
     h5_path: &str,
     extract_dir: &str,
     file_key: Option<&str>,
     parallel: usize,
     verbose: bool,
+    validate: bool,
+    _checksum: Option<&str>,
 ) {
     let h5_path = shellexpand::tilde(h5_path).to_string();
     let extract_dir_expanded = shellexpand::tilde(extract_dir).to_string();
@@ -412,10 +477,15 @@ pub fn extract_h5_to_directory(
         }
     };
 
+    let mut checksum_errors: Vec<String> = Vec::new();
+
     if let Some(key) = file_key {
         match h5f.dataset(key) {
             Ok(ds) => {
                 let data = read_dataset_content(&ds);
+                if validate && !verify_dataset_checksum(&ds, &data, key) {
+                    checksum_errors.push(key.to_string());
+                }
                 let mode = ds
                     .attr("mode")
                     .ok()
@@ -437,6 +507,9 @@ pub fn extract_h5_to_directory(
                 H5ObjType::Dataset => {
                     let ds = h5f.dataset(&name).expect("Failed to open dataset");
                     let data = read_dataset_content(&ds);
+                    if validate && !verify_dataset_checksum(&ds, &data, &name) {
+                        checksum_errors.push(name.clone());
+                    }
                     let mode = ds
                         .attr("mode")
                         .ok()
@@ -504,6 +577,17 @@ pub fn extract_h5_to_directory(
                 println!("Extracted: {}", name);
             }
         }
+    }
+
+    if !checksum_errors.is_empty() {
+        eprintln!("CHECKSUM MISMATCH on {} file(s):", checksum_errors.len());
+        for e in checksum_errors.iter().take(10) {
+            eprintln!("  {}", e);
+        }
+        if checksum_errors.len() > 10 {
+            eprintln!("  ... and {} more", checksum_errors.len() - 10);
+        }
+        std::process::exit(1);
     }
 
     println!("Extraction complete!");

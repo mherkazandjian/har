@@ -24,7 +24,7 @@ fn test_bagit_roundtrip() {
 
     let archive = tmp.path().join("test.h5").to_string_lossy().to_string();
     let src_str = src.to_string_lossy().to_string();
-    pack_bagit(&[src_str.as_str()], &archive, None, None, false, DEFAULT_BATCH_SIZE, 1, false);
+    pack_bagit(&[src_str.as_str()], &archive, None, None, false, DEFAULT_BATCH_SIZE, 1, false, None);
 
     assert!(is_bagit_archive(&archive));
 
@@ -47,7 +47,7 @@ fn test_bagit_single_file_extract() {
 
     let archive = tmp.path().join("test.h5").to_string_lossy().to_string();
     let src_str = src.to_string_lossy().to_string();
-    pack_bagit(&[src_str.as_str()], &archive, None, None, false, DEFAULT_BATCH_SIZE, 1, false);
+    pack_bagit(&[src_str.as_str()], &archive, None, None, false, DEFAULT_BATCH_SIZE, 1, false, None);
 
     let out = tmp.path().join("out");
     fs::create_dir_all(&out).unwrap();
@@ -67,7 +67,7 @@ fn test_bagit_empty_file() {
 
     let archive = tmp.path().join("test.h5").to_string_lossy().to_string();
     let src_str = src.to_string_lossy().to_string();
-    pack_bagit(&[src_str.as_str()], &archive, None, None, false, DEFAULT_BATCH_SIZE, 1, false);
+    pack_bagit(&[src_str.as_str()], &archive, None, None, false, DEFAULT_BATCH_SIZE, 1, false, None);
 
     let out = tmp.path().join("out");
     fs::create_dir_all(&out).unwrap();
@@ -88,7 +88,7 @@ fn test_bagit_binary_roundtrip() {
 
     let archive = tmp.path().join("test.h5").to_string_lossy().to_string();
     let src_str = src.to_string_lossy().to_string();
-    pack_bagit(&[src_str.as_str()], &archive, None, None, false, DEFAULT_BATCH_SIZE, 1, false);
+    pack_bagit(&[src_str.as_str()], &archive, None, None, false, DEFAULT_BATCH_SIZE, 1, false, None);
 
     let out = tmp.path().join("out");
     fs::create_dir_all(&out).unwrap();
@@ -109,7 +109,7 @@ fn test_bagit_permissions() {
 
     let archive = tmp.path().join("test.h5").to_string_lossy().to_string();
     let src_str = src.to_string_lossy().to_string();
-    pack_bagit(&[src_str.as_str()], &archive, None, None, false, DEFAULT_BATCH_SIZE, 1, false);
+    pack_bagit(&[src_str.as_str()], &archive, None, None, false, DEFAULT_BATCH_SIZE, 1, false, None);
 
     let out = tmp.path().join("out");
     fs::create_dir_all(&out).unwrap();
@@ -132,7 +132,7 @@ fn test_bagit_empty_dir() {
 
     let archive = tmp.path().join("test.h5").to_string_lossy().to_string();
     let src_str = src.to_string_lossy().to_string();
-    pack_bagit(&[src_str.as_str()], &archive, None, None, false, DEFAULT_BATCH_SIZE, 1, false);
+    pack_bagit(&[src_str.as_str()], &archive, None, None, false, DEFAULT_BATCH_SIZE, 1, false, None);
 
     let out = tmp.path().join("out");
     fs::create_dir_all(&out).unwrap();
@@ -154,7 +154,7 @@ fn test_bagit_batch_splitting() {
 
     let archive = tmp.path().join("test.h5").to_string_lossy().to_string();
     let src_str = src.to_string_lossy().to_string();
-    pack_bagit(&[src_str.as_str()], &archive, None, None, false, 500, 1, false);
+    pack_bagit(&[src_str.as_str()], &archive, None, None, false, 500, 1, false, None);
 
     let h5f = hdf5::File::open(&archive).unwrap();
     let n_batches = h5f.group("batches").unwrap().member_names().unwrap().len();
@@ -179,7 +179,7 @@ fn test_bagit_parallel_roundtrip() {
 
     let archive = tmp.path().join("test.h5").to_string_lossy().to_string();
     let src_str = src.to_string_lossy().to_string();
-    pack_bagit(&[src_str.as_str()], &archive, None, None, false, DEFAULT_BATCH_SIZE, 4, false);
+    pack_bagit(&[src_str.as_str()], &archive, None, None, false, DEFAULT_BATCH_SIZE, 4, false, None);
 
     let out = tmp.path().join("out");
     fs::create_dir_all(&out).unwrap();
@@ -203,7 +203,7 @@ fn test_bagit_many_files() {
 
     let archive = tmp.path().join("test.h5").to_string_lossy().to_string();
     let src_str = src.to_string_lossy().to_string();
-    pack_bagit(&[src_str.as_str()], &archive, None, None, false, DEFAULT_BATCH_SIZE, 4, false);
+    pack_bagit(&[src_str.as_str()], &archive, None, None, false, DEFAULT_BATCH_SIZE, 4, false, None);
 
     let out = tmp.path().join("out");
     fs::create_dir_all(&out).unwrap();
@@ -226,7 +226,7 @@ fn test_bagit_compression() {
 
     let archive = tmp.path().join("test.h5").to_string_lossy().to_string();
     let src_str = src.to_string_lossy().to_string();
-    pack_bagit(&[src_str.as_str()], &archive, Some("gzip"), Some(9), true, DEFAULT_BATCH_SIZE, 1, false);
+    pack_bagit(&[src_str.as_str()], &archive, Some("gzip"), Some(9), true, DEFAULT_BATCH_SIZE, 1, false, None);
 
     let out = tmp.path().join("out");
     fs::create_dir_all(&out).unwrap();
@@ -242,4 +242,51 @@ fn test_parse_batch_size_fn() {
     assert_eq!(parse_batch_size("64M"), 64 * 1024 * 1024);
     assert_eq!(parse_batch_size("1G"), 1024 * 1024 * 1024);
     assert_eq!(parse_batch_size("512K"), 512 * 1024);
+}
+
+#[test]
+fn test_bagit_checksum_blake3() {
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("file1.txt"), "Hello world").unwrap();
+    fs::write(src.join("file2.txt"), "Another file").unwrap();
+
+    let archive = tmp.path().join("test.h5").to_string_lossy().to_string();
+    let src_str = src.to_string_lossy().to_string();
+    pack_bagit(&[src_str.as_str()], &archive, None, None, false, DEFAULT_BATCH_SIZE, 1, false, Some("blake3"));
+
+    // Verify the checksum algo attribute is stored
+    let h5f = hdf5::File::open(&archive).unwrap();
+    let algo: hdf5::types::VarLenUnicode = h5f.attr("har_checksum_algo").unwrap().read_scalar().unwrap();
+    assert_eq!(algo.as_str(), "blake3");
+    drop(h5f);
+
+    // Extract with validation
+    let out = tmp.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    let out_str = out.to_string_lossy().to_string();
+    extract_bagit(&archive, &out_str, None, true, false, 1, false);
+
+    assert_eq!(fs::read_to_string(out.join("src/file1.txt")).unwrap(), "Hello world");
+    assert_eq!(fs::read_to_string(out.join("src/file2.txt")).unwrap(), "Another file");
+}
+
+#[test]
+fn test_bagit_checksum_md5() {
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("data.txt"), "test data").unwrap();
+
+    let archive = tmp.path().join("test.h5").to_string_lossy().to_string();
+    let src_str = src.to_string_lossy().to_string();
+    pack_bagit(&[src_str.as_str()], &archive, None, None, false, DEFAULT_BATCH_SIZE, 1, false, Some("md5"));
+
+    let out = tmp.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    let out_str = out.to_string_lossy().to_string();
+    extract_bagit(&archive, &out_str, None, true, false, 1, false);
+
+    assert_eq!(fs::read_to_string(out.join("src/data.txt")).unwrap(), "test data");
 }

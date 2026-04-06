@@ -66,7 +66,7 @@ fn test_archive_creation() {
         &[env.src_dir.as_str()],
         &env.archive_path,
         "w",
-        None, None, false, 1, false,
+        None, None, false, 1, false, None,
     );
     assert!(Path::new(&env.archive_path).exists());
 
@@ -83,7 +83,7 @@ fn test_append() {
         &[env.src_dir.as_str()],
         &env.archive_path,
         "w",
-        None, None, false, 1, false,
+        None, None, false, 1, false, None,
     );
 
     let file3 = format!("{}/file3.txt", env.src_dir);
@@ -93,7 +93,7 @@ fn test_append() {
         &[file3.as_str()],
         &env.archive_path,
         "a",
-        None, None, false, 1, false,
+        None, None, false, 1, false, None,
     );
 
     let h5f = hdf5::File::open(&env.archive_path).unwrap();
@@ -107,9 +107,9 @@ fn test_extract_all() {
         &[env.src_dir.as_str()],
         &env.archive_path,
         "w",
-        None, None, false, 1, false,
+        None, None, false, 1, false, None,
     );
-    extract_h5_to_directory(&env.archive_path, &env.extract_dir, None, 1, false);
+    extract_h5_to_directory(&env.archive_path, &env.extract_dir, None, 1, false, false, None);
 
     let extracted1 = format!("{}/src/file1.txt", env.extract_dir);
     assert!(Path::new(&extracted1).exists());
@@ -130,7 +130,7 @@ fn test_extract_single() {
         &[env.src_dir.as_str()],
         &env.archive_path,
         "w",
-        None, None, false, 1, false,
+        None, None, false, 1, false, None,
     );
     extract_h5_to_directory(
         &env.archive_path,
@@ -138,6 +138,8 @@ fn test_extract_single() {
         Some("src/file1.txt"),
         1,
         false,
+        false,
+        None,
     );
 
     let extracted1 = format!("{}/src/file1.txt", env.extract_dir);
@@ -155,7 +157,7 @@ fn test_list_contents() {
         &[env.src_dir.as_str()],
         &env.archive_path,
         "w",
-        None, None, false, 1, false,
+        None, None, false, 1, false, None,
     );
 
     // Capture stdout - we just verify the function runs without error
@@ -187,7 +189,7 @@ fn test_multi_directory_no_collision() {
         &[dir_a_str.as_str(), dir_b_str.as_str()],
         &archive,
         "w",
-        None, None, false, 1, false,
+        None, None, false, 1, false, None,
     );
 
     let h5f = hdf5::File::open(&archive).unwrap();
@@ -197,7 +199,7 @@ fn test_multi_directory_no_collision() {
     let extract_dir = base.join("out");
     fs::create_dir_all(&extract_dir).unwrap();
     let extract_str = extract_dir.to_string_lossy().to_string();
-    extract_h5_to_directory(&archive, &extract_str, None, 1, false);
+    extract_h5_to_directory(&archive, &extract_str, None, 1, false, false, None);
 
     assert_eq!(
         fs::read_to_string(extract_dir.join("dirA/readme.txt")).unwrap(),
@@ -221,12 +223,12 @@ fn test_empty_directory_preserved() {
 
     let archive = base.join("empty.h5").to_string_lossy().to_string();
     let src_str = src.to_string_lossy().to_string();
-    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 1, false);
+    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 1, false, None);
 
     let extract_dir = base.join("out");
     fs::create_dir_all(&extract_dir).unwrap();
     let extract_str = extract_dir.to_string_lossy().to_string();
-    extract_h5_to_directory(&archive, &extract_str, None, 1, false);
+    extract_h5_to_directory(&archive, &extract_str, None, 1, false, false, None);
 
     assert!(extract_dir.join("project/empty_sub").is_dir());
     assert!(extract_dir.join("project/nonempty/f.txt").is_file());
@@ -250,12 +252,12 @@ fn test_file_permissions_preserved() {
 
     let archive = base.join("perms.h5").to_string_lossy().to_string();
     let src_str = src.to_string_lossy().to_string();
-    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 1, false);
+    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 1, false, None);
 
     let extract_dir = base.join("out");
     fs::create_dir_all(&extract_dir).unwrap();
     let extract_str = extract_dir.to_string_lossy().to_string();
-    extract_h5_to_directory(&archive, &extract_str, None, 1, false);
+    extract_h5_to_directory(&archive, &extract_str, None, 1, false, false, None);
 
     let extracted_exec = extract_dir.join("perms/run.sh");
     let extracted_ro = extract_dir.join("perms/readonly.txt");
@@ -299,12 +301,12 @@ fn test_empty_file_roundtrip() {
 
     let archive = base.join("empty_file.h5").to_string_lossy().to_string();
     let src_str = src.to_string_lossy().to_string();
-    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 1, false);
+    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 1, false, None);
 
     let extract_dir = base.join("out");
     fs::create_dir_all(&extract_dir).unwrap();
     let extract_str = extract_dir.to_string_lossy().to_string();
-    extract_h5_to_directory(&archive, &extract_str, None, 1, false);
+    extract_h5_to_directory(&archive, &extract_str, None, 1, false, false, None);
 
     let extracted = extract_dir.join("emptysrc/empty.txt");
     assert!(extracted.exists());
@@ -323,12 +325,12 @@ fn test_binary_file_roundtrip() {
 
     let archive = base.join("bin.h5").to_string_lossy().to_string();
     let src_str = src.to_string_lossy().to_string();
-    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 1, false);
+    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 1, false, None);
 
     let extract_dir = base.join("out");
     fs::create_dir_all(&extract_dir).unwrap();
     let extract_str = extract_dir.to_string_lossy().to_string();
-    extract_h5_to_directory(&archive, &extract_str, None, 1, false);
+    extract_h5_to_directory(&archive, &extract_str, None, 1, false, false, None);
 
     let extracted = extract_dir.join("binsrc/allbytes.bin");
     assert_eq!(fs::read(&extracted).unwrap(), all_bytes);
@@ -355,12 +357,13 @@ fn test_compression_roundtrip() {
         true,
         1,
         false,
+        None,
     );
 
     let extract_dir = base.join("out");
     fs::create_dir_all(&extract_dir).unwrap();
     let extract_str = extract_dir.to_string_lossy().to_string();
-    extract_h5_to_directory(&archive, &extract_str, None, 1, false);
+    extract_h5_to_directory(&archive, &extract_str, None, 1, false, false, None);
 
     assert_eq!(
         fs::read_to_string(extract_dir.join("comp/data.txt")).unwrap(),
@@ -383,7 +386,7 @@ fn test_parallel_ingest() {
     make_test_tree(&src_str, 3, 4);
 
     let archive = base.join("par.h5").to_string_lossy().to_string();
-    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 4, false);
+    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 4, false, None);
 
     let h5f = hdf5::File::open(&archive).unwrap();
     let mut keys = Vec::new();
@@ -397,7 +400,7 @@ fn test_parallel_ingest() {
     let extract_dir = base.join("out");
     fs::create_dir_all(&extract_dir).unwrap();
     let extract_str = extract_dir.to_string_lossy().to_string();
-    extract_h5_to_directory(&archive, &extract_str, None, 1, false);
+    extract_h5_to_directory(&archive, &extract_str, None, 1, false, false, None);
 
     for i in 0..3 {
         for j in 0..4 {
@@ -422,12 +425,12 @@ fn test_parallel_extract() {
     make_test_tree(&src_str, 3, 4);
 
     let archive = base.join("seq.h5").to_string_lossy().to_string();
-    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 1, false);
+    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 1, false, None);
 
     let extract_dir = base.join("out");
     fs::create_dir_all(&extract_dir).unwrap();
     let extract_str = extract_dir.to_string_lossy().to_string();
-    extract_h5_to_directory(&archive, &extract_str, None, 4, false);
+    extract_h5_to_directory(&archive, &extract_str, None, 4, false, false, None);
 
     for i in 0..3 {
         for j in 0..4 {
@@ -459,12 +462,12 @@ fn test_parallel_roundtrip() {
 
     let archive = base.join("rt.h5").to_string_lossy().to_string();
     let src_str = src.to_string_lossy().to_string();
-    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 3, false);
+    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 3, false, None);
 
     let extract_dir = base.join("out");
     fs::create_dir_all(&extract_dir).unwrap();
     let extract_str = extract_dir.to_string_lossy().to_string();
-    extract_h5_to_directory(&archive, &extract_str, None, 3, false);
+    extract_h5_to_directory(&archive, &extract_str, None, 3, false, false, None);
 
     // Verify text file
     assert_eq!(
@@ -509,12 +512,13 @@ fn test_parallel_ingest_with_compression() {
         true,
         2,
         false,
+        None,
     );
 
     let extract_dir = base.join("out");
     fs::create_dir_all(&extract_dir).unwrap();
     let extract_str = extract_dir.to_string_lossy().to_string();
-    extract_h5_to_directory(&archive, &extract_str, None, 1, false);
+    extract_h5_to_directory(&archive, &extract_str, None, 1, false, false, None);
 
     assert_eq!(
         fs::read_to_string(extract_dir.join("comp/big.txt")).unwrap(),
@@ -534,12 +538,12 @@ fn test_parallel_append_skips_existing() {
 
     let archive = base.join("app.h5").to_string_lossy().to_string();
     let src_str = src.to_string_lossy().to_string();
-    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 2, false);
+    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 2, false, None);
 
     // Modify and append — should skip existing
     fs::write(src.join("f.txt"), "v2").unwrap();
     fs::write(src.join("new.txt"), "new").unwrap();
-    pack_or_append_to_h5(&[src_str.as_str()], &archive, "a", None, None, false, 2, false);
+    pack_or_append_to_h5(&[src_str.as_str()], &archive, "a", None, None, false, 2, false, None);
 
     let h5f = hdf5::File::open(&archive).unwrap();
     let ds_f: Vec<u8> = h5f.dataset("app/f.txt").unwrap().read_raw().unwrap();
@@ -561,12 +565,12 @@ fn test_parallel_extract_preserves_permissions() {
 
     let archive = base.join("perms.h5").to_string_lossy().to_string();
     let src_str = src.to_string_lossy().to_string();
-    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 1, false);
+    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 1, false, None);
 
     let extract_dir = base.join("out");
     fs::create_dir_all(&extract_dir).unwrap();
     let extract_str = extract_dir.to_string_lossy().to_string();
-    extract_h5_to_directory(&archive, &extract_str, None, 2, false);
+    extract_h5_to_directory(&archive, &extract_str, None, 2, false, false, None);
 
     assert_eq!(
         fs::metadata(extract_dir.join("perms/exec.sh"))
@@ -589,12 +593,12 @@ fn test_parallel_extract_preserves_empty_dirs() {
 
     let archive = base.join("emp.h5").to_string_lossy().to_string();
     let src_str = src.to_string_lossy().to_string();
-    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 1, false);
+    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 1, false, None);
 
     let extract_dir = base.join("out");
     fs::create_dir_all(&extract_dir).unwrap();
     let extract_str = extract_dir.to_string_lossy().to_string();
-    extract_h5_to_directory(&archive, &extract_str, None, 2, false);
+    extract_h5_to_directory(&archive, &extract_str, None, 2, false, false, None);
 
     assert!(extract_dir.join("emp/empty").is_dir());
     assert!(extract_dir.join("emp/full/f.txt").is_file());
@@ -611,12 +615,12 @@ fn test_parallel_many_small_files() {
     make_test_tree(&src_str, 10, 10);
 
     let archive = base.join("many.h5").to_string_lossy().to_string();
-    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 8, false);
+    pack_or_append_to_h5(&[src_str.as_str()], &archive, "w", None, None, false, 8, false, None);
 
     let extract_dir = base.join("out");
     fs::create_dir_all(&extract_dir).unwrap();
     let extract_str = extract_dir.to_string_lossy().to_string();
-    extract_h5_to_directory(&archive, &extract_str, None, 8, false);
+    extract_h5_to_directory(&archive, &extract_str, None, 8, false, false, None);
 
     let mut count = 0;
     for entry in walkdir::WalkDir::new(extract_dir.join("many"))
@@ -639,4 +643,92 @@ fn test_parallel_many_small_files() {
             );
         }
     }
+}
+
+#[test]
+fn test_checksum_sha256_roundtrip() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path();
+
+    let src = base.join("cksum");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("hello.txt"), "hello world").unwrap();
+
+    let archive = base.join("cksum.h5").to_string_lossy().to_string();
+    let src_str = src.to_string_lossy().to_string();
+    pack_or_append_to_h5(
+        &[src_str.as_str()], &archive, "w",
+        None, None, false, 1, false, Some("sha256"),
+    );
+
+    // Verify checksum attributes were stored
+    let h5f = hdf5::File::open(&archive).unwrap();
+    let ds = h5f.dataset("cksum/hello.txt").unwrap();
+    let algo: hdf5::types::VarLenUnicode = ds.attr("har_checksum_algo").unwrap().read_scalar().unwrap();
+    assert_eq!(algo.as_str(), "sha256");
+    let hash: hdf5::types::VarLenUnicode = ds.attr("har_checksum").unwrap().read_scalar().unwrap();
+    assert!(!hash.as_str().is_empty());
+    drop(h5f);
+
+    // Extract with validation
+    let extract_dir = base.join("out");
+    fs::create_dir_all(&extract_dir).unwrap();
+    let extract_str = extract_dir.to_string_lossy().to_string();
+    extract_h5_to_directory(&archive, &extract_str, None, 1, false, true, Some("sha256"));
+
+    assert_eq!(
+        fs::read_to_string(extract_dir.join("cksum/hello.txt")).unwrap(),
+        "hello world"
+    );
+}
+
+#[test]
+fn test_checksum_blake3_roundtrip() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path();
+
+    let src = base.join("b3");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("data.bin"), vec![42u8; 1000]).unwrap();
+
+    let archive = base.join("b3.h5").to_string_lossy().to_string();
+    let src_str = src.to_string_lossy().to_string();
+    pack_or_append_to_h5(
+        &[src_str.as_str()], &archive, "w",
+        None, None, false, 1, false, Some("blake3"),
+    );
+
+    let extract_dir = base.join("out");
+    fs::create_dir_all(&extract_dir).unwrap();
+    let extract_str = extract_dir.to_string_lossy().to_string();
+    extract_h5_to_directory(&archive, &extract_str, None, 1, false, true, Some("blake3"));
+
+    assert_eq!(fs::read(extract_dir.join("b3/data.bin")).unwrap(), vec![42u8; 1000]);
+}
+
+#[test]
+fn test_checksum_md5_roundtrip() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path();
+
+    let src = base.join("md5");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("test.txt"), "md5 test content").unwrap();
+
+    let archive = base.join("md5.h5").to_string_lossy().to_string();
+    let src_str = src.to_string_lossy().to_string();
+    pack_or_append_to_h5(
+        &[src_str.as_str()], &archive, "w",
+        None, None, false, 1, false, Some("md5"),
+    );
+
+    let extract_dir = base.join("out");
+    fs::create_dir_all(&extract_dir).unwrap();
+    let extract_str = extract_dir.to_string_lossy().to_string();
+    extract_h5_to_directory(&archive, &extract_str, None, 1, false, true, Some("md5"));
+
+    assert_eq!(
+        fs::read_to_string(extract_dir.join("md5/test.txt")).unwrap(),
+        "md5 test content"
+    );
 }

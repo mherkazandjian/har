@@ -1,5 +1,4 @@
 use rayon::prelude::*;
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -76,18 +75,12 @@ fn human_size(bytes: usize) -> String {
     format!("{:.1} PB", size)
 }
 
-fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    format!("{:x}", hasher.finalize())
-}
-
-fn read_and_hash(path: &Path) -> std::io::Result<(Vec<u8>, u32, String)> {
+fn read_and_hash(path: &Path, algo: &str) -> std::io::Result<(Vec<u8>, u32, String)> {
     let mut content = Vec::new();
     fs::File::open(path)?.read_to_end(&mut content)?;
     let mode = fs::metadata(path)?.permissions().mode();
-    let sha = sha256_hex(&content);
-    Ok((content, mode, sha))
+    let hash = crate::compute_checksum(&content, algo);
+    Ok((content, mode, hash))
 }
 
 // ---------------------------------------------------------------------------
@@ -217,10 +210,10 @@ fn generate_manifest(records: &[(String, String)]) -> Vec<u8> {
     out.into_bytes()
 }
 
-fn generate_tagmanifest(tag_files: &[(&str, &[u8])]) -> Vec<u8> {
+fn generate_tagmanifest(tag_files: &[(&str, &[u8])], algo: &str) -> Vec<u8> {
     let mut entries: Vec<(String, String)> = tag_files
         .iter()
-        .map(|(name, content)| (name.to_string(), sha256_hex(content)))
+        .map(|(name, content)| (name.to_string(), crate::compute_checksum(content, algo)))
         .collect();
     entries.sort();
     let mut out = String::new();
@@ -243,6 +236,7 @@ pub fn pack_bagit(
     batch_size: usize,
     parallel: usize,
     verbose: bool,
+    checksum: Option<&str>,
 ) {
     let output_h5 = shellexpand::tilde(output_h5).to_string();
     let t0 = Instant::now();
@@ -256,12 +250,13 @@ pub fn pack_bagit(
         println!("Inventory: {} files, {} empty dirs", sorted_entries.len(), empty_dirs.len());
     }
 
-    // Phase 2: Read + SHA-256
+    // Phase 2: Read + checksum
+    let hash_algo = checksum.unwrap_or("sha256");
     let inventory: Vec<InventoryItem> = if parallel <= 1 {
         sorted_entries
             .iter()
             .map(|e| {
-                let (content, mode, sha) = read_and_hash(&e.file_path).expect("Failed to read file");
+                let (content, mode, hash) = read_and_hash(&e.file_path, hash_algo).expect("Failed to read file");
                 if verbose {
                     println!("  Read: {}", e.rel_path);
                 }
@@ -269,7 +264,7 @@ pub fn pack_bagit(
                     bagit_path: format!("data/{}", e.rel_path),
                     content,
                     mode,
-                    sha256: sha,
+                    sha256: hash,
                 }
             })
             .collect()
@@ -282,13 +277,13 @@ pub fn pack_bagit(
             sorted_entries
                 .par_iter()
                 .map(|e| {
-                    let (content, mode, sha) =
-                        read_and_hash(&e.file_path).expect("Failed to read file");
+                    let (content, mode, hash) =
+                        read_and_hash(&e.file_path, hash_algo).expect("Failed to read file");
                     InventoryItem {
                         bagit_path: format!("data/{}", e.rel_path),
                         content,
                         mode,
-                        sha256: sha,
+                        sha256: hash,
                     }
                 })
                 .collect()
@@ -311,14 +306,16 @@ pub fn pack_bagit(
         .map(|f| (f.bagit_path.clone(), f.sha256.clone()))
         .collect();
 
+    let manifest_name = format!("manifest-{}.txt", hash_algo);
+    let tagmanifest_name = format!("tagmanifest-{}.txt", hash_algo);
     let bagit_txt = generate_bagit_txt();
     let bag_info_txt = generate_bag_info(total_bytes, file_count);
     let manifest_txt = generate_manifest(&manifest_records);
     let tagmanifest_txt = generate_tagmanifest(&[
         ("bagit.txt", &bagit_txt),
         ("bag-info.txt", &bag_info_txt),
-        ("manifest-sha256.txt", &manifest_txt),
-    ]);
+        (&manifest_name, &manifest_txt),
+    ], hash_algo);
 
     // Phase 5: Write HDF5
     let h5f = hdf5::File::create(&output_h5)
@@ -336,6 +333,12 @@ pub fn pack_bagit(
         .create("har_version")
         .unwrap()
         .write_scalar(&HAR_VERSION_VALUE.parse::<hdf5::types::VarLenUnicode>().unwrap())
+        .unwrap();
+    h5f.new_attr::<hdf5::types::VarLenUnicode>()
+        .shape(())
+        .create("har_checksum_algo")
+        .unwrap()
+        .write_scalar(&hash_algo.parse::<hdf5::types::VarLenUnicode>().unwrap())
         .unwrap();
 
     // Index — store as parallel arrays (simpler than compound types in hdf5-rs)
@@ -430,8 +433,8 @@ pub fn pack_bagit(
     for (name, content) in &[
         ("bagit.txt", &bagit_txt[..]),
         ("bag-info.txt", &bag_info_txt[..]),
-        ("manifest-sha256.txt", &manifest_txt[..]),
-        ("tagmanifest-sha256.txt", &tagmanifest_txt[..]),
+        (&manifest_name[..], &manifest_txt[..]),
+        (&tagmanifest_name[..], &tagmanifest_txt[..]),
     ] {
         bagit_grp.new_dataset::<u8>().shape(content.len()).create(*name).unwrap()
             .write_raw(content).unwrap();
@@ -479,6 +482,13 @@ pub fn extract_bagit(
         Err(e) => { eprintln!("Error: cannot open '{}': {}", h5_path, e); std::process::exit(1); }
     };
 
+    // Read checksum algorithm from archive (defaults to sha256 for older archives)
+    let hash_algo = h5f.attr("har_checksum_algo")
+        .ok()
+        .and_then(|a| a.read_scalar::<hdf5::types::VarLenUnicode>().ok())
+        .map(|v| v.as_str().to_string())
+        .unwrap_or_else(|| "sha256".to_string());
+
     // Read index arrays
     let idx = h5f.group("index_data").expect("Missing index_data group");
     let count = idx.attr("count").unwrap().read_scalar::<u64>().unwrap() as usize;
@@ -519,7 +529,7 @@ pub fn extract_bagit(
                 if mode != 0 { fs::set_permissions(&dest, fs::Permissions::from_mode(mode)).ok(); }
 
                 if validate {
-                    let actual = sha256_hex(file_bytes);
+                    let actual = crate::compute_checksum(file_bytes, &hash_algo);
                     if actual != shas[i] {
                         eprintln!("CHECKSUM MISMATCH: {}", out_path);
                         std::process::exit(1);
@@ -562,7 +572,7 @@ pub fn extract_bagit(
                 fs::File::create(&dest).unwrap().write_all(file_bytes).unwrap();
                 if mode != 0 { fs::set_permissions(&dest, fs::Permissions::from_mode(mode)).ok(); }
 
-                if validate && sha256_hex(file_bytes) != shas[i] {
+                if validate && crate::compute_checksum(file_bytes, &hash_algo) != shas[i] {
                     errors.push(out_path.to_string());
                 }
                 if verbose { println!("Extracted: {}", out_path); }
