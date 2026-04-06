@@ -1,7 +1,7 @@
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "har", about = "Archive, append, extract, or list an HDF5 archive.")]
+#[command(name = "har", version = env!("CARGO_PKG_VERSION"), about = "Archive, append, extract, or list an HDF5 archive.")]
 struct Cli {
     /// Create archive from one or more directories/files
     #[arg(short = 'c', group = "operation")]
@@ -79,6 +79,14 @@ struct Cli {
     #[arg(long = "checksum", value_parser = ["md5", "sha256", "blake3"])]
     checksum: Option<String>,
 
+    /// Write metadata.json manifest of user HDF5 attributes on extraction
+    #[arg(long = "metadata-json")]
+    metadata_json: bool,
+
+    /// Capture/restore filesystem extended attributes (user.* namespace)
+    #[arg(long = "xattr")]
+    xattr: bool,
+
     /// Source directories/files (for -c/-r) or file key to extract (for -x)
     #[arg(trailing_var_arg = true)]
     path: Vec<String>,
@@ -126,16 +134,17 @@ fn main() {
             let sources: Vec<&str> = cli.path.iter().map(|s| s.as_str()).collect();
             har::bagit::pack_bagit(
                 &sources, &cli.file, compression, compression_opts,
-                cli.shuffle, bs, cli.parallel, cli.verbose, checksum,
+                cli.shuffle, bs, cli.parallel, cli.verbose, checksum, cli.xattr,
             );
         } else if cli.extract {
             let file_key = if cli.path.is_empty() { None } else { Some(cli.path[0].as_str()) };
             har::bagit::extract_bagit(
                 &cli.file, &cli.directory, file_key,
                 cli.validate, cli.bagit_raw, cli.parallel, cli.verbose,
+                cli.metadata_json, cli.xattr,
             );
         } else if cli.list {
-            har::bagit::list_bagit(&cli.file);
+            har::bagit::list_bagit(&cli.file, cli.bagit_raw);
         }
         return;
     }
@@ -148,9 +157,10 @@ fn main() {
             har::bagit::extract_bagit(
                 &cli.file, &cli.directory, file_key,
                 cli.validate, cli.bagit_raw, cli.parallel, cli.verbose,
+                cli.metadata_json, cli.xattr,
             );
         } else {
-            har::bagit::list_bagit(&cli.file);
+            har::bagit::list_bagit(&cli.file, cli.bagit_raw);
         }
         return;
     }
@@ -164,7 +174,7 @@ fn main() {
         let sources: Vec<&str> = cli.path.iter().map(|s| s.as_str()).collect();
         har::pack_or_append_to_h5(
             &sources, &cli.file, "w", compression, compression_opts,
-            cli.shuffle, cli.parallel, cli.verbose, checksum,
+            cli.shuffle, cli.parallel, cli.verbose, checksum, cli.xattr,
         );
     } else if cli.append {
         if cli.path.is_empty() {
@@ -174,13 +184,13 @@ fn main() {
         let sources: Vec<&str> = cli.path.iter().map(|s| s.as_str()).collect();
         har::pack_or_append_to_h5(
             &sources, &cli.file, "a", compression, compression_opts,
-            cli.shuffle, cli.parallel, cli.verbose, checksum,
+            cli.shuffle, cli.parallel, cli.verbose, checksum, cli.xattr,
         );
     } else if cli.extract {
         let file_key = if cli.path.is_empty() { None } else { Some(cli.path[0].as_str()) };
         har::extract_h5_to_directory(
             &cli.file, &cli.directory, file_key, cli.parallel, cli.verbose,
-            cli.validate, checksum,
+            cli.validate, checksum, cli.metadata_json, cli.xattr,
         );
     } else if cli.list {
         har::list_h5_contents(&cli.file);

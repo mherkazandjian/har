@@ -323,10 +323,10 @@ def mpi_extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
 # MPI List
 # ---------------------------------------------------------------------------
 
-def mpi_list_bagit(h5_path):
+def mpi_list_bagit(h5_path, bagit_raw=False):
     MPI, h5py = _check_mpi()
     comm = MPI.COMM_WORLD
     if comm.Get_rank() == 0:
         from har_bagit import list_bagit
-        list_bagit(h5_path)
+        list_bagit(h5_path, bagit_raw=bagit_raw)
     comm.Barrier()

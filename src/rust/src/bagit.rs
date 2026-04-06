@@ -87,7 +87,7 @@ fn read_and_hash(path: &Path, algo: &str) -> std::io::Result<(Vec<u8>, u32, Stri
 // Inventory (shared with legacy mode)
 // ---------------------------------------------------------------------------
 
-pub fn build_inventory(sources: &[&str]) -> (Vec<FileEntry>, Vec<String>) {
+fn build_inventory(sources: &[&str]) -> (Vec<FileEntry>, Vec<String>) {
     let mut file_entries = Vec::new();
     let mut empty_dirs = Vec::new();
 
@@ -227,6 +227,7 @@ fn generate_tagmanifest(tag_files: &[(&str, &[u8])], algo: &str) -> Vec<u8> {
 // Pack
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub fn pack_bagit(
     sources: &[&str],
     output_h5: &str,
@@ -237,6 +238,7 @@ pub fn pack_bagit(
     parallel: usize,
     verbose: bool,
     checksum: Option<&str>,
+    xattr_flag: bool,
 ) {
     let output_h5 = shellexpand::tilde(output_h5).to_string();
     let t0 = Instant::now();
@@ -252,12 +254,33 @@ pub fn pack_bagit(
 
     // Phase 2: Read + checksum
     let hash_algo = checksum.unwrap_or("sha256");
+    let mut progress = crate::Progress::new(if verbose { sorted_entries.len() } else { 0 });
+    let verbose_file = verbose && !progress.is_tty;
+
+    let mut user_metadata_map: std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>> =
+        std::collections::BTreeMap::new();
+
     let inventory: Vec<InventoryItem> = if parallel <= 1 {
         sorted_entries
             .iter()
             .map(|e| {
                 let (content, mode, hash) = read_and_hash(&e.file_path, hash_algo).expect("Failed to read file");
-                if verbose {
+                if xattr_flag {
+                    let xattrs = crate::metadata::read_xattrs(&e.file_path);
+                    if !xattrs.is_empty() {
+                        use base64::Engine;
+                        let mut xmap = serde_json::Map::new();
+                        for (name, value) in &xattrs {
+                            let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+                            xmap.insert(name.clone(), serde_json::json!(format!("base64:{}", encoded)));
+                        }
+                        let mut entry = serde_json::Map::new();
+                        entry.insert("xattrs".to_string(), serde_json::Value::Object(xmap));
+                        user_metadata_map.insert(e.rel_path.clone(), entry);
+                    }
+                }
+                progress.inc(&e.rel_path);
+                if verbose_file {
                     println!("  Read: {}", e.rel_path);
                 }
                 InventoryItem {
@@ -273,7 +296,7 @@ pub fn pack_bagit(
             .num_threads(parallel)
             .build()
             .expect("Failed to build thread pool");
-        pool.install(|| {
+        let items: Vec<InventoryItem> = pool.install(|| {
             sorted_entries
                 .par_iter()
                 .map(|e| {
@@ -287,8 +310,30 @@ pub fn pack_bagit(
                     }
                 })
                 .collect()
-        })
+        });
+        if xattr_flag {
+            for (item, entry) in items.iter().zip(sorted_entries.iter()) {
+                let xattrs = crate::metadata::read_xattrs(&entry.file_path);
+                if !xattrs.is_empty() {
+                    use base64::Engine;
+                    let mut xmap = serde_json::Map::new();
+                    for (name, value) in &xattrs {
+                        let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+                        xmap.insert(name.clone(), serde_json::json!(format!("base64:{}", encoded)));
+                    }
+                    let mut meta_entry = serde_json::Map::new();
+                    meta_entry.insert("xattrs".to_string(), serde_json::Value::Object(xmap));
+                    let rel = item.bagit_path.strip_prefix("data/").unwrap_or(&item.bagit_path);
+                    user_metadata_map.insert(rel.to_string(), meta_entry);
+                }
+            }
+        }
+        for item in &items {
+            progress.inc(&item.bagit_path);
+        }
+        items
     };
+    progress.finish();
 
     // Phase 3: Batch assignment
     let total_bytes: usize = inventory.iter().map(|i| i.content.len()).sum();
@@ -448,6 +493,9 @@ pub fn pack_bagit(
             .write_raw(&blob).unwrap();
     }
 
+    // User metadata (xattrs)
+    crate::metadata::write_user_metadata_dataset(&h5f, &user_metadata_map);
+
     h5f.close().ok();
     let elapsed = t0.elapsed().as_secs_f64();
     println!("\nOperation completed in {:.2} seconds.", elapsed);
@@ -460,6 +508,7 @@ pub fn pack_bagit(
 // Extract
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub fn extract_bagit(
     h5_path: &str,
     extract_dir: &str,
@@ -468,6 +517,8 @@ pub fn extract_bagit(
     bagit_raw: bool,
     parallel: usize,
     verbose: bool,
+    metadata_json: bool,
+    xattr_flag: bool,
 ) {
     let h5_path = shellexpand::tilde(h5_path).to_string();
     let extract_dir = shellexpand::tilde(extract_dir).to_string();
@@ -480,6 +531,13 @@ pub fn extract_bagit(
     let h5f = match hdf5::File::open(&h5_path) {
         Ok(f) => f,
         Err(e) => { eprintln!("Error: cannot open '{}': {}", h5_path, e); std::process::exit(1); }
+    };
+
+    // Read user metadata (for --xattr / --metadata-json)
+    let user_metadata = if xattr_flag || metadata_json {
+        crate::metadata::read_user_metadata_dataset(&h5f)
+    } else {
+        std::collections::BTreeMap::new()
     };
 
     // Read checksum algorithm from archive (defaults to sha256 for older archives)
@@ -535,6 +593,40 @@ pub fn extract_bagit(
                         std::process::exit(1);
                     }
                 }
+
+                // Restore xattrs for this file
+                let rel_key = lookup.strip_prefix("data/").unwrap_or(&lookup);
+                if xattr_flag {
+                    if let Some(meta) = user_metadata.get(rel_key) {
+                        if let Some(xattrs) = meta.get("xattrs") {
+                            if let Some(xmap) = xattrs.as_object() {
+                                crate::metadata::restore_xattrs_from_json(&dest, xmap);
+                            }
+                        }
+                    }
+                }
+
+                // Write metadata.json for single-file extract
+                if metadata_json {
+                    if let Some(meta) = user_metadata.get(rel_key) {
+                        let mut all = std::collections::BTreeMap::new();
+                        let mut fm = crate::metadata::FileMetadata {
+                            hdf5_attrs: serde_json::Map::new(),
+                            xattrs_json: serde_json::Map::new(),
+                            xattrs_raw: std::collections::BTreeMap::new(),
+                        };
+                        if let Some(xa) = meta.get("xattrs") {
+                            if let Some(xmap) = xa.as_object() {
+                                fm.xattrs_json = xmap.clone();
+                            }
+                        }
+                        if !fm.is_empty() {
+                            all.insert(rel_key.to_string(), fm);
+                            crate::metadata::write_metadata_json(extract_path, &all);
+                        }
+                    }
+                }
+
                 if verbose { println!("Extracted: {}", out_path); }
             }
             None => {
@@ -548,11 +640,13 @@ pub fn extract_bagit(
 
     // Full extraction — group by batch
     let mut by_batch: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
-    for i in 0..count {
-        by_batch.entry(batch_ids[i]).or_default().push(i);
+    for (i, &bid) in batch_ids.iter().enumerate().take(count) {
+        by_batch.entry(bid).or_default().push(i);
     }
 
     let mut errors = Vec::new();
+    let mut progress = crate::Progress::new(if verbose { count } else { 0 });
+    let verbose_file = verbose && !progress.is_tty;
 
     for (bid, indices) in &by_batch {
         let batch_ds = h5f.dataset(&format!("batches/{}", bid)).unwrap();
@@ -572,10 +666,23 @@ pub fn extract_bagit(
                 fs::File::create(&dest).unwrap().write_all(file_bytes).unwrap();
                 if mode != 0 { fs::set_permissions(&dest, fs::Permissions::from_mode(mode)).ok(); }
 
+                // Restore xattrs
+                let rel_key = path.strip_prefix("data/").unwrap_or(path);
+                if xattr_flag {
+                    if let Some(meta) = user_metadata.get(rel_key) {
+                        if let Some(xattrs) = meta.get("xattrs") {
+                            if let Some(xmap) = xattrs.as_object() {
+                                crate::metadata::restore_xattrs_from_json(&dest, xmap);
+                            }
+                        }
+                    }
+                }
+
                 if validate && crate::compute_checksum(file_bytes, &hash_algo) != shas[i] {
                     errors.push(out_path.to_string());
                 }
-                if verbose { println!("Extracted: {}", out_path); }
+                progress.inc(out_path);
+                if verbose_file { println!("Extracted: {}", out_path); }
             }
         } else {
             // Parallel write
@@ -597,10 +704,28 @@ pub fn extract_bagit(
                     if let Some(p) = dest.parent() { fs::create_dir_all(p).ok(); }
                     fs::File::create(&dest).unwrap().write_all(file_bytes).unwrap();
                     if mode != 0 { fs::set_permissions(&dest, fs::Permissions::from_mode(mode)).ok(); }
+
+                    // Restore xattrs
+                    let rel_key = path.strip_prefix("data/").unwrap_or(path);
+                    if xattr_flag {
+                        if let Some(meta) = user_metadata.get(rel_key) {
+                            if let Some(xattrs) = meta.get("xattrs") {
+                                if let Some(xmap) = xattrs.as_object() {
+                                    crate::metadata::restore_xattrs_from_json(&dest, xmap);
+                                }
+                            }
+                        }
+                    }
                 });
             });
+            for &i in indices {
+                let path = paths[i];
+                let out_path = if bagit_raw { path } else { path.strip_prefix("data/").unwrap_or(path) };
+                progress.inc(out_path);
+            }
         }
     }
+    progress.finish();
 
     // Empty dirs
     if let Ok(ds) = h5f.dataset("empty_dirs") {
@@ -628,6 +753,29 @@ pub fn extract_bagit(
         }
     }
 
+    // Write metadata.json manifest
+    if metadata_json && !user_metadata.is_empty() {
+        let mut all_meta = std::collections::BTreeMap::new();
+        for (path, meta) in &user_metadata {
+            let mut fm = crate::metadata::FileMetadata {
+                hdf5_attrs: serde_json::Map::new(),
+                xattrs_json: serde_json::Map::new(),
+                xattrs_raw: std::collections::BTreeMap::new(),
+            };
+            if let Some(xa) = meta.get("xattrs") {
+                if let Some(xmap) = xa.as_object() {
+                    fm.xattrs_json = xmap.clone();
+                }
+            }
+            if !fm.is_empty() {
+                all_meta.insert(path.clone(), fm);
+            }
+        }
+        if !all_meta.is_empty() {
+            crate::metadata::write_metadata_json(extract_path, &all_meta);
+        }
+    }
+
     if !errors.is_empty() {
         eprintln!("CHECKSUM MISMATCH on {} file(s):", errors.len());
         for e in errors.iter().take(10) { eprintln!("  {}", e); }
@@ -642,7 +790,7 @@ pub fn extract_bagit(
 // List
 // ---------------------------------------------------------------------------
 
-pub fn list_bagit(h5_path: &str) {
+pub fn list_bagit(h5_path: &str, bagit_raw: bool) {
     let h5_path = shellexpand::tilde(h5_path).to_string();
     if !Path::new(&h5_path).exists() {
         eprintln!("Error: archive '{}' not found.", h5_path);
@@ -653,13 +801,29 @@ pub fn list_bagit(h5_path: &str) {
         Err(e) => { eprintln!("Error: cannot open '{}': {}", h5_path, e); std::process::exit(1); }
     };
 
+    let mut tag_files: Vec<String> = Vec::new();
+    if bagit_raw {
+        if let Ok(grp) = h5f.group("bagit") {
+            tag_files = grp.member_names().unwrap_or_default();
+            tag_files.sort();
+        }
+    }
+
     let idx = h5f.group("index_data").expect("Missing index_data group");
     let paths_blob: Vec<u8> = idx.dataset("paths").unwrap().read_raw().unwrap();
     let paths_str = String::from_utf8(paths_blob).unwrap();
-    let mut paths: Vec<&str> = paths_str.split('\n').collect();
+    let mut paths: Vec<String> = if bagit_raw {
+        paths_str.split('\n').map(|p| format!("data/{}", p)).collect()
+    } else {
+        paths_str.split('\n').map(|p| p.to_string()).collect()
+    };
     paths.sort();
 
-    println!("Contents of {} ({} files)", h5_path, paths.len());
+    let total = paths.len() + tag_files.len();
+    println!("Contents of {} ({} entries)", h5_path, total);
+    for t in &tag_files {
+        println!("{}", t);
+    }
     for p in &paths {
         println!("{}", p);
     }

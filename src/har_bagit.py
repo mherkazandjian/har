@@ -8,7 +8,9 @@ BagIt manifests (SHA-256 checksums, bag-info) are embedded in the archive.
 
 import os
 import sys
+import base64
 import hashlib
+import json
 import datetime
 import time
 import concurrent.futures
@@ -16,6 +18,47 @@ import concurrent.futures
 import h5py
 import numpy as np
 
+
+
+class ProgressBar:
+    """Simple terminal progress bar with last-5-files display."""
+    def __init__(self, total):
+        self.total = total
+        self.current = 0
+        self.recent = []
+        self.prev_lines = 0
+        self.is_tty = sys.stderr.isatty() and total > 0
+
+    def update(self, filename):
+        self.current += 1
+        self.recent.append(filename)
+        if len(self.recent) > 5:
+            self.recent.pop(0)
+        if self.is_tty:
+            self._render()
+
+    def _render(self):
+        if self.prev_lines > 0:
+            sys.stderr.write(f'\x1b[{self.prev_lines}A')
+        pct = self.current * 100 // max(self.total, 1)
+        bar_width = 40
+        filled = bar_width * self.current // max(self.total, 1)
+        empty = bar_width - filled
+        sys.stderr.write(f'\x1b[2K[{"█" * filled}{"░" * empty}] {pct}% ({self.current}/{self.total})\n')
+        for f in self.recent:
+            sys.stderr.write(f'\x1b[2K  {f}\n')
+        self.prev_lines = 1 + len(self.recent)
+        sys.stderr.flush()
+
+    def finish(self):
+        if not self.is_tty or self.prev_lines == 0:
+            return
+        sys.stderr.write(f'\x1b[{self.prev_lines}A')
+        for _ in range(self.prev_lines):
+            sys.stderr.write('\x1b[2K\n')
+        sys.stderr.write(f'\x1b[{self.prev_lines}A')
+        sys.stderr.flush()
+        self.prev_lines = 0
 
 
 def compute_checksum(data, algo):
@@ -219,7 +262,7 @@ def _generate_tagmanifest(tag_files, algo='sha256'):
 
 def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
                shuffle=False, batch_size=DEFAULT_BATCH_SIZE, parallel=1,
-               verbose=False, checksum=None):
+               verbose=False, checksum=None, xattr_flag=False):
     """Create a BagIt-mode HDF5 archive with batched storage."""
     output_h5 = os.path.expanduser(output_h5)
     t0 = time.time()
@@ -231,25 +274,49 @@ def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
         print(f"Inventory: {len(file_entries)} files, {len(empty_dirs)} empty dirs")
 
     # Phase 2: Read + checksum (parallelizable)
+    progress = ProgressBar(len(file_entries) if verbose else 0)
+    verbose_file = verbose and not progress.is_tty
+
+    user_metadata_map = {}
+
     if parallel <= 1:
         inventory = []
         for file_path, rel_path in sorted(file_entries, key=lambda x: x[1]):
             content, mode, hash_hex = _read_and_hash(file_path, hash_algo)
             bagit_path = "data/" + rel_path
             inventory.append((bagit_path, content, mode, hash_hex))
-            if verbose:
+            if xattr_flag:
+                from har import _read_xattrs
+                xattrs = _read_xattrs(file_path)
+                if xattrs:
+                    xmap = {}
+                    for name, value in xattrs.items():
+                        xmap[name] = 'base64:' + base64.b64encode(value).decode('ascii')
+                    user_metadata_map[rel_path] = {'xattrs': xmap}
+            progress.update(rel_path)
+            if verbose_file:
                 print(f"  Read: {rel_path}")
     else:
         sorted_entries = sorted(file_entries, key=lambda x: x[1])
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
             futures = [executor.submit(_read_and_hash, fp, hash_algo) for fp, _ in sorted_entries]
             inventory = []
-            for (_, rel_path), future in zip(sorted_entries, futures):
+            for (file_path, rel_path), future in zip(sorted_entries, futures):
                 content, mode, hash_hex = future.result()
                 bagit_path = "data/" + rel_path
                 inventory.append((bagit_path, content, mode, hash_hex))
-                if verbose:
+                if xattr_flag:
+                    from har import _read_xattrs
+                    xattrs = _read_xattrs(file_path)
+                    if xattrs:
+                        xmap = {}
+                        for name, value in xattrs.items():
+                            xmap[name] = 'base64:' + base64.b64encode(value).decode('ascii')
+                        user_metadata_map[rel_path] = {'xattrs': xmap}
+                progress.update(rel_path)
+                if verbose_file:
                     print(f"  Read: {rel_path}")
+    progress.finish()
 
     # Phase 3: Batch assignment
     batches = _assign_batches(inventory, batch_size)
@@ -334,6 +401,13 @@ def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
                 'empty_dirs',
                 data=np.array([d.encode('utf-8') for d in bagit_empty], dtype=dt))
 
+        # User metadata (xattrs)
+        if user_metadata_map:
+            json_blob = json.dumps(user_metadata_map, indent=2, sort_keys=True).encode('utf-8')
+            h5f.create_dataset('user_metadata',
+                               data=np.frombuffer(json_blob, dtype=np.uint8),
+                               dtype=np.uint8)
+
     t1 = time.time()
     print(f"\nOperation completed in {t1 - t0:.2f} seconds.")
     print(f"  {file_count} files in {len(batches)} batches, "
@@ -346,7 +420,8 @@ def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
 # ---------------------------------------------------------------------------
 
 def extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
-                  bagit_raw=False, parallel=1, verbose=False):
+                  bagit_raw=False, parallel=1, verbose=False,
+                  metadata_json=False, xattr_flag=False):
     """Extract a BagIt-mode HDF5 archive."""
     h5_path = os.path.expanduser(h5_path)
     extract_dir = os.path.expanduser(extract_dir)
@@ -369,6 +444,15 @@ def extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
 
         # Read checksum algorithm from archive (defaults to sha256)
         hash_algo = h5f.attrs.get('har_checksum_algo', 'sha256')
+
+        # Read user metadata
+        user_metadata = {}
+        if (xattr_flag or metadata_json) and 'user_metadata' in h5f:
+            blob = h5f['user_metadata'][()].tobytes()
+            try:
+                user_metadata = json.loads(blob)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
 
         # Read index
         index = h5f['index'][()]
@@ -413,6 +497,20 @@ def extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
                 if actual != sha256:
                     print(f"CHECKSUM MISMATCH: {out_path}", file=sys.stderr)
                     sys.exit(1)
+            # Restore xattrs
+            rel_key = rec['path'].decode('utf-8').removeprefix('data/')
+            if xattr_flag and rel_key in user_metadata:
+                xattrs = user_metadata[rel_key].get('xattrs', {})
+                if xattrs:
+                    from har import _restore_xattrs_from_json
+                    _restore_xattrs_from_json(dest, xattrs)
+            # Write metadata.json
+            if metadata_json and rel_key in user_metadata:
+                meta = user_metadata[rel_key]
+                xattrs_json = meta.get('xattrs', {})
+                if xattrs_json:
+                    from har import _write_metadata_json
+                    _write_metadata_json(extract_dir, {rel_key: ({}, xattrs_json, {})})
             if verbose:
                 print(f"Extracted: {out_path}")
             print("Extraction complete!")
@@ -427,6 +525,9 @@ def extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
 
         errors = []
         batch_ids = sorted(by_batch.keys())
+        file_count = len(index)
+        progress = ProgressBar(file_count if verbose else 0)
+        verbose_file = verbose and not progress.is_tty
 
         def _extract_from_batch(batch_id, records, batch_data):
             """Extract all files from one batch buffer."""
@@ -449,11 +550,19 @@ def extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
                     fout.write(file_bytes)
                 if mode:
                     os.chmod(dest, mode)
+                # Restore xattrs
+                rel_key = path.removeprefix('data/')
+                if xattr_flag and rel_key in user_metadata:
+                    xattrs = user_metadata[rel_key].get('xattrs', {})
+                    if xattrs:
+                        from har import _restore_xattrs_from_json
+                        _restore_xattrs_from_json(dest, xattrs)
                 if validate:
                     actual = _checksum_bytes(file_bytes, hash_algo)
                     if actual != sha256:
                         errors.append(out_path)
-                if verbose:
+                progress.update(out_path)
+                if verbose_file:
                     print(f"Extracted: {out_path}")
 
         if parallel <= 1:
@@ -476,6 +585,20 @@ def extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
                     work.append((out_path, file_bytes, mode, extract_dir))
                 with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as ex:
                     ex.map(_write_extracted_file_bagit, work)
+                # Restore xattrs after parallel write
+                if xattr_flag:
+                    from har import _restore_xattrs_from_json
+                    for rec in records:
+                        path = rec['path'].decode('utf-8')
+                        rel_key = path.removeprefix('data/')
+                        if rel_key in user_metadata:
+                            xattrs = user_metadata[rel_key].get('xattrs', {})
+                            if xattrs:
+                                out_path = path if bagit_raw else rel_key
+                                dest = os.path.join(extract_dir, out_path)
+                                _restore_xattrs_from_json(dest, xattrs)
+                for out_path, _, _, _ in work:
+                    progress.update(out_path)
                 if validate:
                     for rec in records:
                         offset = int(rec['offset'])
@@ -487,13 +610,14 @@ def extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
                         actual = _checksum_bytes(file_bytes, hash_algo)
                         if actual != sha256:
                             errors.append(out_path)
+        progress.finish()
 
         # Empty directories
         for d in empty_dirs:
             out_path = d if bagit_raw else d.removeprefix('data/')
             dest = os.path.join(extract_dir, out_path)
             os.makedirs(dest, exist_ok=True)
-            if verbose:
+            if verbose_file:
                 print(f"Created empty dir: {out_path}")
 
         # BagIt tag files (only with --bagit-raw)
@@ -505,6 +629,17 @@ def extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
                     fout.write(content)
                 if verbose:
                     print(f"Wrote tag file: {name}")
+
+    # Write metadata.json
+    if metadata_json and user_metadata:
+        from har import _write_metadata_json
+        all_meta = {}
+        for path, meta in user_metadata.items():
+            xattrs_json = meta.get('xattrs', {})
+            if xattrs_json:
+                all_meta[path] = ({}, xattrs_json, {})
+        if all_meta:
+            _write_metadata_json(extract_dir, all_meta)
 
     if errors:
         print(f"CHECKSUM MISMATCH on {len(errors)} file(s):", file=sys.stderr)
@@ -532,7 +667,7 @@ def _write_extracted_file_bagit(args):
 # List
 # ---------------------------------------------------------------------------
 
-def list_bagit(h5_path):
+def list_bagit(h5_path, bagit_raw=False):
     """List contents of a BagIt-mode HDF5 archive."""
     h5_path = os.path.expanduser(h5_path)
     if not os.path.exists(h5_path):
@@ -550,8 +685,19 @@ def list_bagit(h5_path):
             print(f"Error: not a bagit-v1 archive.", file=sys.stderr)
             sys.exit(1)
 
+        tag_files = []
+        if bagit_raw and 'bagit' in h5f:
+            tag_files = sorted(h5f['bagit'].keys())
+
         index = h5f['index'][()]
-        paths = sorted(rec['path'].decode('utf-8') for rec in index)
-        print(f"Contents of {h5_path} ({len(paths)} files)")
+        if bagit_raw:
+            paths = sorted('data/' + rec['path'].decode('utf-8') for rec in index)
+        else:
+            paths = sorted(rec['path'].decode('utf-8') for rec in index)
+
+        total = len(paths) + len(tag_files)
+        print(f"Contents of {h5_path} ({total} entries)")
+        for t in tag_files:
+            print(t)
         for p in paths:
             print(p)

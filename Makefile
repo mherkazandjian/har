@@ -59,7 +59,7 @@ endif
 	rust-static-sandbox-apptainer rust-static-sandbox-docker rust-static-sandbox-native \
 	build-rust build-rust-debug build-rust-release \
 	build-rust-static build-rust-release-static \
-	clean-rust install-rust
+	clean-rust install-rust lint lint-rust lint-python
 
 nothing:
 
@@ -213,6 +213,15 @@ build-rust-release-static: $(NEED_STATIC_ENV)
 
 test-rust: $(NEED_DYNAMIC_ENV)
 	$(RUN_DYNAMIC) "cd $(WORKDIR) && cargo test"
+
+lint: lint-rust lint-python
+
+lint-rust: $(NEED_DYNAMIC_ENV)
+	$(RUN_DYNAMIC) "cd $(WORKDIR) && cargo clippy -- -D warnings"
+
+lint-python:
+	python3 -m py_compile src/har.py
+	python3 -m py_compile src/har_bagit.py
 
 clean-rust:
 	rm -rf $(RUST_DIR)/target $(RUST_DIR)/.cargo_home $(RUST_DIR)/.rustup_home

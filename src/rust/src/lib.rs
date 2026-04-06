@@ -2,11 +2,90 @@ use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use walkdir::WalkDir;
+
+// ---------------------------------------------------------------------------
+// Progress bar
+// ---------------------------------------------------------------------------
+
+pub struct Progress {
+    total: usize,
+    current: usize,
+    recent: Vec<String>,
+    prev_lines: usize,
+    pub is_tty: bool,
+}
+
+impl Progress {
+    pub fn new(total: usize) -> Self {
+        Progress {
+            total,
+            current: 0,
+            recent: Vec::new(),
+            prev_lines: 0,
+            is_tty: io::stderr().is_terminal() && total > 0,
+        }
+    }
+
+    pub fn inc(&mut self, filename: &str) {
+        self.current += 1;
+        self.recent.push(filename.to_string());
+        if self.recent.len() > 5 {
+            self.recent.remove(0);
+        }
+        if self.is_tty {
+            self.render();
+        }
+    }
+
+    fn render(&mut self) {
+        let mut err = io::stderr().lock();
+        if self.prev_lines > 0 {
+            write!(err, "\x1b[{}A", self.prev_lines).ok();
+        }
+
+        let pct = self.current * 100 / self.total.max(1);
+        let bar_width = 40;
+        let filled = bar_width * self.current / self.total.max(1);
+        let empty = bar_width - filled;
+
+        writeln!(
+            err,
+            "\x1b[2K[{}{}] {}% ({}/{})",
+            "█".repeat(filled),
+            "░".repeat(empty),
+            pct,
+            self.current,
+            self.total
+        )
+        .ok();
+
+        for f in &self.recent {
+            writeln!(err, "\x1b[2K  {}", f).ok();
+        }
+
+        self.prev_lines = 1 + self.recent.len();
+        err.flush().ok();
+    }
+
+    pub fn finish(&mut self) {
+        if !self.is_tty || self.prev_lines == 0 {
+            return;
+        }
+        let mut err = io::stderr().lock();
+        write!(err, "\x1b[{}A", self.prev_lines).ok();
+        for _ in 0..self.prev_lines {
+            writeln!(err, "\x1b[2K").ok();
+        }
+        write!(err, "\x1b[{}A", self.prev_lines).ok();
+        err.flush().ok();
+        self.prev_lines = 0;
+    }
+}
 
 /// Compress data with LZMA.
 pub fn lzma_compress(data: &[u8]) -> Vec<u8> {
@@ -60,6 +139,7 @@ struct FileEntry {
 
 /// Data read from a file, ready to be written into HDF5.
 struct ReadResult {
+    file_path: PathBuf,
     rel_path: String,
     content: Vec<u8>,
     mode: u32,
@@ -200,6 +280,7 @@ fn create_dataset(
 /// Archive or append the given sources into an HDF5 archive.
 ///
 /// `file_mode` should be `"w"` to create a new archive (truncate) or `"a"` to append.
+#[allow(clippy::too_many_arguments)]
 pub fn pack_or_append_to_h5(
     sources: &[&str],
     output_h5: &str,
@@ -210,6 +291,7 @@ pub fn pack_or_append_to_h5(
     parallel: usize,
     verbose: bool,
     checksum: Option<&str>,
+    xattr_flag: bool,
 ) {
     let output_h5 = shellexpand::tilde(output_h5).to_string();
     let t0 = Instant::now();
@@ -288,18 +370,19 @@ pub fn pack_or_append_to_h5(
             .unwrap_or_else(|e| panic!("Failed to create '{}': {}", output_h5, e))
     };
 
+    let mut progress = Progress::new(if verbose { file_entries.len() } else { 0 });
+    let verbose_file = verbose && !progress.is_tty;
+
     let write_to_h5 =
-        |h5f: &hdf5::File, rel_path: &str, content: &[u8], mode: u32, create_groups: bool| {
-            if verbose {
+        |h5f: &hdf5::File, rel_path: &str, content: &[u8], mode: u32, create_groups: bool, file_path: Option<&Path>| {
+            if verbose_file {
                 println!("Storing: {}", rel_path);
             }
-            if is_append {
-                if h5f.dataset(rel_path).is_ok() {
-                    if verbose {
-                        println!("Skipping {} (already exists)", rel_path);
-                    }
-                    return;
+            if is_append && h5f.dataset(rel_path).is_ok() {
+                if verbose_file {
+                    println!("Skipping {} (already exists)", rel_path);
                 }
+                return;
             }
             if create_groups {
                 if let Some(parent) = Path::new(rel_path).parent() {
@@ -316,13 +399,25 @@ pub fn pack_or_append_to_h5(
                 .expect("Failed to create mode attr")
                 .write_scalar(&mode)
                 .expect("Failed to write mode attr");
+            if xattr_flag {
+                if let Some(fp) = file_path {
+                    let xattrs = metadata::read_xattrs(fp);
+                    for (name, value) in &xattrs {
+                        let attr_name = format!("xattr.{}", name);
+                        if let Ok(a) = ds.new_attr::<u8>().shape(value.len()).create(&*attr_name) {
+                            a.write_raw(value).ok();
+                        }
+                    }
+                }
+            }
         };
 
     if parallel <= 1 {
         // Sequential path
         for entry in &file_entries {
             let (content, mode) = read_file(&entry.file_path).expect("Failed to read file");
-            write_to_h5(&h5f, &entry.rel_path, &content, mode, true);
+            write_to_h5(&h5f, &entry.rel_path, &content, mode, true, Some(&entry.file_path));
+            progress.inc(&entry.rel_path);
         }
     } else {
         // Parallel path: read files in parallel, then write to HDF5 sequentially
@@ -351,6 +446,7 @@ pub fn pack_or_append_to_h5(
                     let (content, mode) =
                         read_file(&entry.file_path).expect("Failed to read file");
                     ReadResult {
+                        file_path: entry.file_path.clone(),
                         rel_path: entry.rel_path.clone(),
                         content,
                         mode,
@@ -360,9 +456,11 @@ pub fn pack_or_append_to_h5(
         });
 
         for r in &read_results {
-            write_to_h5(&h5f, &r.rel_path, &r.content, r.mode, false);
+            write_to_h5(&h5f, &r.rel_path, &r.content, r.mode, false, Some(&r.file_path));
+            progress.inc(&r.rel_path);
         }
     }
+    progress.finish();
 
     // Store empty directories
     for rel_dir in &empty_dirs {
@@ -373,7 +471,7 @@ pub fn pack_or_append_to_h5(
             .expect("Failed to create empty_dir attr")
             .write_scalar(&1u8)
             .expect("Failed to write empty_dir attr");
-        if verbose {
+        if verbose_file {
             println!("Storing empty dir: {}", rel_dir);
         }
     }
@@ -451,6 +549,7 @@ fn verify_dataset_checksum(ds: &hdf5::Dataset, content: &[u8], name: &str) -> bo
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn extract_h5_to_directory(
     h5_path: &str,
     extract_dir: &str,
@@ -459,6 +558,8 @@ pub fn extract_h5_to_directory(
     verbose: bool,
     validate: bool,
     _checksum: Option<&str>,
+    metadata_json: bool,
+    xattr_flag: bool,
 ) {
     let h5_path = shellexpand::tilde(h5_path).to_string();
     let extract_dir_expanded = shellexpand::tilde(extract_dir).to_string();
@@ -478,6 +579,8 @@ pub fn extract_h5_to_directory(
     };
 
     let mut checksum_errors: Vec<String> = Vec::new();
+    let mut all_metadata: std::collections::BTreeMap<String, metadata::FileMetadata> =
+        std::collections::BTreeMap::new();
 
     if let Some(key) = file_key {
         match h5f.dataset(key) {
@@ -491,6 +594,16 @@ pub fn extract_h5_to_directory(
                     .ok()
                     .and_then(|a| a.read_scalar::<u32>().ok());
                 write_extracted_file(key, &data, mode, extract_path);
+                if metadata_json || xattr_flag {
+                    let meta = metadata::collect_user_metadata(&ds);
+                    if xattr_flag {
+                        let dest = extract_path.join(key);
+                        metadata::restore_xattrs(&dest, &meta.xattrs_raw);
+                    }
+                    if !meta.is_empty() {
+                        all_metadata.insert(key.to_string(), meta);
+                    }
+                }
                 if verbose {
                     println!("Extracted: {}", key);
                 }
@@ -500,83 +613,124 @@ pub fn extract_h5_to_directory(
                 std::process::exit(1);
             }
         }
-    } else if parallel <= 1 {
-        // Sequential full extraction
-        for (name, obj_type) in collect_items(&h5f) {
-            match obj_type {
-                H5ObjType::Dataset => {
-                    let ds = h5f.dataset(&name).expect("Failed to open dataset");
-                    let data = read_dataset_content(&ds);
-                    if validate && !verify_dataset_checksum(&ds, &data, &name) {
-                        checksum_errors.push(name.clone());
-                    }
-                    let mode = ds
-                        .attr("mode")
-                        .ok()
-                        .and_then(|a| a.read_scalar::<u32>().ok());
-                    write_extracted_file(&name, &data, mode, extract_path);
-                    if verbose {
-                        println!("Extracted: {}", name);
-                    }
-                }
-                H5ObjType::EmptyDirGroup => {
-                    let dest = extract_path.join(&name);
-                    fs::create_dir_all(&dest).ok();
-                    if verbose {
-                        println!("Created empty dir: {}", name);
-                    }
-                }
-                H5ObjType::Group => {}
-            }
-        }
     } else {
-        // Parallel full extraction
-        let mut read_items: Vec<(String, Vec<u8>, Option<u32>)> = Vec::new();
-        let mut empty_dir_names: Vec<String> = Vec::new();
+        let items = collect_items(&h5f);
+        let total = items.iter().filter(|(_, t)| matches!(t, H5ObjType::Dataset | H5ObjType::EmptyDirGroup)).count();
+        let mut progress = Progress::new(if verbose { total } else { 0 });
+        let verbose_file = verbose && !progress.is_tty;
 
-        for (name, obj_type) in collect_items(&h5f) {
-            match obj_type {
-                H5ObjType::Dataset => {
-                    let ds = h5f.dataset(&name).expect("Failed to open dataset");
-                    let data = read_dataset_content(&ds);
-                    let mode = ds
-                        .attr("mode")
-                        .ok()
-                        .and_then(|a| a.read_scalar::<u32>().ok());
-                    read_items.push((name, data, mode));
+        if parallel <= 1 {
+            // Sequential full extraction
+            for (name, obj_type) in &items {
+                match obj_type {
+                    H5ObjType::Dataset => {
+                        let ds = h5f.dataset(name).expect("Failed to open dataset");
+                        let data = read_dataset_content(&ds);
+                        if validate && !verify_dataset_checksum(&ds, &data, name) {
+                            checksum_errors.push(name.clone());
+                        }
+                        let mode = ds
+                            .attr("mode")
+                            .ok()
+                            .and_then(|a| a.read_scalar::<u32>().ok());
+                        write_extracted_file(name, &data, mode, extract_path);
+                        if metadata_json || xattr_flag {
+                            let meta = metadata::collect_user_metadata(&ds);
+                            if xattr_flag {
+                                let dest = extract_path.join(name);
+                                metadata::restore_xattrs(&dest, &meta.xattrs_raw);
+                            }
+                            if !meta.is_empty() {
+                                all_metadata.insert(name.clone(), meta);
+                            }
+                        }
+                        progress.inc(name);
+                        if verbose_file {
+                            println!("Extracted: {}", name);
+                        }
+                    }
+                    H5ObjType::EmptyDirGroup => {
+                        let dest = extract_path.join(name);
+                        fs::create_dir_all(&dest).ok();
+                        progress.inc(name);
+                        if verbose_file {
+                            println!("Created empty dir: {}", name);
+                        }
+                    }
+                    H5ObjType::Group => {}
                 }
-                H5ObjType::EmptyDirGroup => {
-                    empty_dir_names.push(name);
+            }
+        } else {
+            // Parallel full extraction
+            let mut read_items: Vec<(String, Vec<u8>, Option<u32>)> = Vec::new();
+            let mut empty_dir_names: Vec<String> = Vec::new();
+
+            for (name, obj_type) in &items {
+                match obj_type {
+                    H5ObjType::Dataset => {
+                        let ds = h5f.dataset(name).expect("Failed to open dataset");
+                        let data = read_dataset_content(&ds);
+                        let mode = ds
+                            .attr("mode")
+                            .ok()
+                            .and_then(|a| a.read_scalar::<u32>().ok());
+                        if metadata_json || xattr_flag {
+                            let meta = metadata::collect_user_metadata(&ds);
+                            if !meta.is_empty() {
+                                all_metadata.insert(name.clone(), meta);
+                            }
+                        }
+                        read_items.push((name.clone(), data, mode));
+                        progress.inc(name);
+                    }
+                    H5ObjType::EmptyDirGroup => {
+                        empty_dir_names.push(name.clone());
+                    }
+                    H5ObjType::Group => {}
                 }
-                H5ObjType::Group => {}
             }
-        }
 
-        for name in &empty_dir_names {
-            let dest = extract_path.join(name);
-            fs::create_dir_all(&dest).ok();
-            if verbose {
-                println!("Created empty dir: {}", name);
+            for name in &empty_dir_names {
+                let dest = extract_path.join(name);
+                fs::create_dir_all(&dest).ok();
+                progress.inc(name);
+                if verbose_file {
+                    println!("Created empty dir: {}", name);
+                }
             }
-        }
 
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(parallel)
-            .build()
-            .expect("Failed to build rayon thread pool");
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(parallel)
+                .build()
+                .expect("Failed to build rayon thread pool");
 
-        let ep = extract_path.to_path_buf();
-        pool.install(|| {
-            read_items.par_iter().for_each(|(name, data, mode)| {
-                write_extracted_file(name, data, *mode, &ep);
+            let ep = extract_path.to_path_buf();
+            pool.install(|| {
+                read_items.par_iter().for_each(|(name, data, mode)| {
+                    write_extracted_file(name, data, *mode, &ep);
+                });
             });
-        });
 
-        if verbose {
-            for (name, _, _) in &read_items {
-                println!("Extracted: {}", name);
+            if xattr_flag {
+                for (name, _, _) in &read_items {
+                    if let Some(meta) = all_metadata.get(name) {
+                        let dest = ep.join(name);
+                        metadata::restore_xattrs(&dest, &meta.xattrs_raw);
+                    }
+                }
+            }
+
+            if verbose_file {
+                for (name, _, _) in &read_items {
+                    println!("Extracted: {}", name);
+                }
             }
         }
+        progress.finish();
+    }
+
+    if metadata_json {
+        metadata::write_metadata_json(extract_path, &all_metadata);
     }
 
     if !checksum_errors.is_empty() {
@@ -625,6 +779,7 @@ pub fn list_h5_contents(h5_path: &str) {
 }
 
 pub mod bagit;
+pub mod metadata;
 
 #[cfg(test)]
 mod tests;

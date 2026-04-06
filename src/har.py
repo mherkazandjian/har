@@ -41,11 +41,54 @@ Usage Examples:
 import os
 import sys
 import argparse
+import base64
 import concurrent.futures
 import hashlib
+import json
 import h5py
 import numpy as np
 import time
+
+
+class ProgressBar:
+    """Simple terminal progress bar with last-5-files display."""
+    def __init__(self, total):
+        self.total = total
+        self.current = 0
+        self.recent = []
+        self.prev_lines = 0
+        self.is_tty = sys.stderr.isatty() and total > 0
+
+    def update(self, filename):
+        self.current += 1
+        self.recent.append(filename)
+        if len(self.recent) > 5:
+            self.recent.pop(0)
+        if self.is_tty:
+            self._render()
+
+    def _render(self):
+        if self.prev_lines > 0:
+            sys.stderr.write(f'\x1b[{self.prev_lines}A')
+        pct = self.current * 100 // max(self.total, 1)
+        bar_width = 40
+        filled = bar_width * self.current // max(self.total, 1)
+        empty = bar_width - filled
+        sys.stderr.write(f'\x1b[2K[{"█" * filled}{"░" * empty}] {pct}% ({self.current}/{self.total})\n')
+        for f in self.recent:
+            sys.stderr.write(f'\x1b[2K  {f}\n')
+        self.prev_lines = 1 + len(self.recent)
+        sys.stderr.flush()
+
+    def finish(self):
+        if not self.is_tty or self.prev_lines == 0:
+            return
+        sys.stderr.write(f'\x1b[{self.prev_lines}A')
+        for _ in range(self.prev_lines):
+            sys.stderr.write('\x1b[2K\n')
+        sys.stderr.write(f'\x1b[{self.prev_lines}A')
+        sys.stderr.flush()
+        self.prev_lines = 0
 
 
 def compute_checksum(data, algo):
@@ -86,6 +129,120 @@ def _chunk_list(lst, n):
     return [lst[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n)]
 
 
+INTERNAL_ATTRS = {'mode', 'empty_dir'}
+XATTR_PREFIX = 'xattr.'
+
+
+def _is_internal_attr(name):
+    """Check if an HDF5 attribute name is internal (managed by har)."""
+    return name.startswith('har_') or name in INTERNAL_ATTRS
+
+
+def _attr_to_json(value):
+    """Convert an HDF5 attribute value to a JSON-serializable Python object."""
+    if isinstance(value, bytes):
+        try:
+            return value.decode('utf-8')
+        except UnicodeDecodeError:
+            return 'base64:' + base64.b64encode(value).decode('ascii')
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    return value
+
+
+def _collect_user_metadata(ds):
+    """Collect user-defined metadata from an HDF5 dataset.
+
+    Returns (hdf5_attrs, xattrs_json, xattrs_raw).
+    """
+    hdf5_attrs = {}
+    xattrs_json = {}
+    xattrs_raw = {}
+    for name in ds.attrs:
+        if _is_internal_attr(name):
+            continue
+        if name.startswith(XATTR_PREFIX):
+            xattr_name = name[len(XATTR_PREFIX):]
+            raw = bytes(ds.attrs[name])
+            xattrs_json[xattr_name] = 'base64:' + base64.b64encode(raw).decode('ascii')
+            xattrs_raw[xattr_name] = raw
+        else:
+            hdf5_attrs[name] = _attr_to_json(ds.attrs[name])
+    return hdf5_attrs, xattrs_json, xattrs_raw
+
+
+def _read_xattrs(path):
+    """Read filesystem extended attributes (user.* namespace only)."""
+    result = {}
+    try:
+        names = os.listxattr(path)
+    except OSError:
+        return result
+    for name in names:
+        if name.startswith('user.'):
+            try:
+                result[name] = os.getxattr(path, name)
+            except OSError:
+                pass
+    return result
+
+
+def _restore_xattrs(path, xattrs):
+    """Restore filesystem extended attributes from raw bytes dict."""
+    for name, value in xattrs.items():
+        try:
+            os.setxattr(path, name, value)
+        except OSError as e:
+            print(f"Warning: failed to set xattr '{name}' on '{path}': {e}",
+                  file=sys.stderr)
+
+
+def _restore_xattrs_from_json(path, xattrs):
+    """Restore xattrs from a JSON map (base64-encoded values)."""
+    for name, value in xattrs.items():
+        if isinstance(value, str) and value.startswith('base64:'):
+            raw = base64.b64decode(value[7:])
+        elif isinstance(value, str):
+            raw = value.encode('utf-8')
+        else:
+            continue
+        try:
+            os.setxattr(path, name, raw)
+        except OSError as e:
+            print(f"Warning: failed to set xattr '{name}' on '{path}': {e}",
+                  file=sys.stderr)
+
+
+def _write_metadata_json(extract_dir, all_metadata):
+    """Write metadata.json manifest to the extract directory."""
+    files = {}
+    for path, (hdf5_attrs, xattrs_json, _xattrs_raw) in all_metadata.items():
+        if not hdf5_attrs and not xattrs_json:
+            continue
+        entry = {}
+        if hdf5_attrs:
+            entry['hdf5_attrs'] = hdf5_attrs
+        if xattrs_json:
+            entry['xattrs'] = xattrs_json
+        if entry:
+            files[path] = entry
+    if not files:
+        return
+    root = {
+        'har_metadata_version': 1,
+        'files': dict(sorted(files.items())),
+    }
+    dest = os.path.join(extract_dir, 'metadata.json')
+    with open(dest, 'w') as f:
+        json.dump(root, f, indent=2, sort_keys=False)
+
+
 def pack_or_append_to_h5(sources,
                          output_h5,
                          file_mode,
@@ -94,7 +251,8 @@ def pack_or_append_to_h5(sources,
                          shuffle=False,
                          parallel=1,
                          verbose=False,
-                         checksum=None):
+                         checksum=None,
+                         xattr_flag=False):
     """
     Archive or append the given sources (directories and/or files) into the HDF5 archive.
 
@@ -133,12 +291,15 @@ def pack_or_append_to_h5(sources,
         else:
             print(f"Warning: '{source}' is not a valid file or directory; skipping.", file=sys.stderr)
 
-    def _write_to_h5(h5fobj, rel_path, content, mode, create_groups=True):
+    progress = ProgressBar(len(file_entries) if verbose else 0)
+    verbose_file = verbose and not progress.is_tty
+
+    def _write_to_h5(h5fobj, rel_path, content, mode, create_groups=True, src_path=None):
         """Write a single file's data to the HDF5 archive."""
-        if verbose:
+        if verbose_file:
             print("Storing:", rel_path)
         if file_mode == 'a' and rel_path in h5fobj:
-            if verbose:
+            if verbose_file:
                 print(f"Skipping {rel_path} (already exists)")
             return
         if create_groups:
@@ -158,18 +319,24 @@ def pack_or_append_to_h5(sources,
         if checksum:
             ds.attrs['har_checksum'] = compute_checksum(content, checksum)
             ds.attrs['har_checksum_algo'] = checksum
+        if xattr_flag and src_path:
+            xattrs = _read_xattrs(src_path)
+            for name, value in xattrs.items():
+                ds.attrs[XATTR_PREFIX + name] = np.void(value)
 
     if parallel <= 1:
         # Sequential path: read and write one file at a time (no extra memory).
         with h5py.File(output_h5, file_mode) as h5fobj:
             for file_path, rel_path in file_entries:
                 content, mode = _read_file(file_path)
-                _write_to_h5(h5fobj, rel_path, content, mode)
+                _write_to_h5(h5fobj, rel_path, content, mode, src_path=file_path)
+                progress.update(rel_path)
             for rel_dir in empty_dirs:
                 grp = h5fobj.require_group(rel_dir)
                 grp.attrs['empty_dir'] = True
-                if verbose:
+                if verbose_file:
                     print(f"Storing empty dir: {rel_dir}")
+        progress.finish()
     else:
         # Parallel path: read files in parallel, then write to HDF5.
         # Pre-collect all unique group paths to batch-create them.
@@ -183,27 +350,30 @@ def pack_or_append_to_h5(sources,
         read_results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
             futures = [executor.submit(_read_file, fp) for fp, _ in file_entries]
-            for (_, rel_path), future in zip(file_entries, futures):
+            for (file_path, rel_path), future in zip(file_entries, futures):
                 content, mode = future.result()
-                read_results.append((rel_path, content, mode))
+                read_results.append((rel_path, content, mode, file_path))
 
         # Phase 3: Serial HDF5 writes (no thread pool overhead, no require_group).
         with h5py.File(output_h5, file_mode) as h5fobj:
             for g in sorted(all_groups):
                 h5fobj.require_group(g)
-            for rel_path, content, mode in read_results:
-                _write_to_h5(h5fobj, rel_path, content, mode, create_groups=False)
+            for rel_path, content, mode, src_path in read_results:
+                _write_to_h5(h5fobj, rel_path, content, mode, create_groups=False, src_path=src_path)
+                progress.update(rel_path)
             for rel_dir in empty_dirs:
                 grp = h5fobj.require_group(rel_dir)
                 grp.attrs['empty_dir'] = True
-                if verbose:
+                if verbose_file:
                     print(f"Storing empty dir: {rel_dir}")
+        progress.finish()
 
     t1 = time.time()
     print(f"\nOperation completed in {t1 - t0:.2f} seconds.")
 
 def extract_h5_to_directory(h5_path, extract_dir, file_key=None, parallel=1,
-                            verbose=False, validate=False, checksum=None):
+                            verbose=False, validate=False, checksum=None,
+                            metadata_json=False, xattr_flag=False):
     """
     Extract files from an HDF5 file.
       - If file_key is None, extract the entire archive.
@@ -247,72 +417,115 @@ def extract_h5_to_directory(h5_path, extract_dir, file_key=None, parallel=1,
                 if actual != stored:
                     print(f"CHECKSUM MISMATCH ({algo}): {file_key}", file=sys.stderr)
                     sys.exit(1)
+            hdf5_attrs, xattrs_json, xattrs_raw = _collect_user_metadata(dataset)
+            if xattr_flag and xattrs_raw:
+                _restore_xattrs(dest_file_path, xattrs_raw)
+            if metadata_json and (hdf5_attrs or xattrs_json):
+                _write_metadata_json(extract_dir, {file_key: (hdf5_attrs, xattrs_json, xattrs_raw)})
             if verbose:
                 print(f"Extracted: {file_key}")
-    elif parallel <= 1:
-        # Sequential full extraction.
-        checksum_errors = []
-        with h5fobj:
-            def extract_item(name, obj):
-                if isinstance(obj, h5py.Dataset):
-                    dest_file_path = os.path.join(extract_dir, name)
-                    os.makedirs(os.path.dirname(dest_file_path), exist_ok=True)
-                    file_bytes = obj[()].tobytes()
-                    with open(dest_file_path, 'wb') as fout:
-                        fout.write(file_bytes)
-                    if 'mode' in obj.attrs:
-                        os.chmod(dest_file_path, obj.attrs['mode'])
-                    if validate and 'har_checksum_algo' in obj.attrs:
-                        algo = obj.attrs['har_checksum_algo']
-                        stored = obj.attrs['har_checksum']
-                        actual = compute_checksum(file_bytes, algo)
-                        if actual != stored:
-                            checksum_errors.append(name)
-                    if verbose:
-                        print(f"Extracted: {name}")
-                elif isinstance(obj, h5py.Group) and obj.attrs.get('empty_dir'):
-                    dest_dir_path = os.path.join(extract_dir, name)
-                    os.makedirs(dest_dir_path, exist_ok=True)
-                    if verbose:
-                        print(f"Created empty dir: {name}")
-            h5fobj.visititems(extract_item)
-        if checksum_errors:
-            print(f"CHECKSUM MISMATCH on {len(checksum_errors)} file(s):", file=sys.stderr)
-            for e in checksum_errors[:10]:
-                print(f"  {e}", file=sys.stderr)
-            if len(checksum_errors) > 10:
-                print(f"  ... and {len(checksum_errors) - 10} more", file=sys.stderr)
-            sys.exit(1)
     else:
-        # Parallel full extraction.
-        # Phase 1: Bulk read all datasets from HDF5 sequentially into memory.
-        # (Single file sequential I/O is fast; filesystem writes are the bottleneck.)
-        read_items = []  # list of (name, bytes, mode|None)
-        empty_dir_names = []
-        with h5fobj:
-            def collector(name, obj):
-                if isinstance(obj, h5py.Dataset):
-                    file_bytes = obj[()].tobytes()
-                    mode = obj.attrs.get('mode', None)
-                    read_items.append((name, file_bytes, mode))
-                elif isinstance(obj, h5py.Group) and obj.attrs.get('empty_dir'):
-                    empty_dir_names.append(name)
-            h5fobj.visititems(collector)
+        # Count items for progress bar
+        item_count = [0]
+        with h5py.File(h5_path, 'r') as h5tmp:
+            def counter(name, obj):
+                if isinstance(obj, h5py.Dataset) or (isinstance(obj, h5py.Group) and obj.attrs.get('empty_dir')):
+                    item_count[0] += 1
+            h5tmp.visititems(counter)
 
-        # Phase 2: Create empty directories (sequential, fast).
-        for name in empty_dir_names:
-            dest_dir_path = os.path.join(extract_dir, name)
-            os.makedirs(dest_dir_path, exist_ok=True)
-            if verbose:
-                print(f"Created empty dir: {name}")
+        progress = ProgressBar(item_count[0] if verbose else 0)
+        verbose_file = verbose and not progress.is_tty
 
-        # Phase 3: Write files to filesystem in parallel.
-        work_items = [(name, data, mode, extract_dir) for name, data, mode in read_items]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
-            executor.map(_write_extracted_file, work_items)
-        if verbose:
-            for name, _, _, _ in work_items:
-                print(f"Extracted: {name}")
+        if parallel <= 1:
+            # Sequential full extraction.
+            checksum_errors = []
+            all_metadata = {}
+            with h5fobj:
+                def extract_item(name, obj):
+                    if isinstance(obj, h5py.Dataset):
+                        dest_file_path = os.path.join(extract_dir, name)
+                        os.makedirs(os.path.dirname(dest_file_path), exist_ok=True)
+                        file_bytes = obj[()].tobytes()
+                        with open(dest_file_path, 'wb') as fout:
+                            fout.write(file_bytes)
+                        if 'mode' in obj.attrs:
+                            os.chmod(dest_file_path, obj.attrs['mode'])
+                        if validate and 'har_checksum_algo' in obj.attrs:
+                            algo = obj.attrs['har_checksum_algo']
+                            stored = obj.attrs['har_checksum']
+                            actual = compute_checksum(file_bytes, algo)
+                            if actual != stored:
+                                checksum_errors.append(name)
+                        hdf5_attrs, xattrs_json, xattrs_raw = _collect_user_metadata(obj)
+                        if xattr_flag and xattrs_raw:
+                            _restore_xattrs(dest_file_path, xattrs_raw)
+                        if hdf5_attrs or xattrs_json:
+                            all_metadata[name] = (hdf5_attrs, xattrs_json, xattrs_raw)
+                        progress.update(name)
+                        if verbose_file:
+                            print(f"Extracted: {name}")
+                    elif isinstance(obj, h5py.Group) and obj.attrs.get('empty_dir'):
+                        dest_dir_path = os.path.join(extract_dir, name)
+                        os.makedirs(dest_dir_path, exist_ok=True)
+                        progress.update(name)
+                        if verbose_file:
+                            print(f"Created empty dir: {name}")
+                h5fobj.visititems(extract_item)
+            progress.finish()
+            if metadata_json and all_metadata:
+                _write_metadata_json(extract_dir, all_metadata)
+            if checksum_errors:
+                print(f"CHECKSUM MISMATCH on {len(checksum_errors)} file(s):", file=sys.stderr)
+                for e in checksum_errors[:10]:
+                    print(f"  {e}", file=sys.stderr)
+                if len(checksum_errors) > 10:
+                    print(f"  ... and {len(checksum_errors) - 10} more", file=sys.stderr)
+                sys.exit(1)
+        else:
+            # Parallel full extraction.
+            # Phase 1: Bulk read all datasets from HDF5 sequentially into memory.
+            read_items = []
+            empty_dir_names = []
+            all_metadata = {}
+            with h5fobj:
+                def collector(name, obj):
+                    if isinstance(obj, h5py.Dataset):
+                        file_bytes = obj[()].tobytes()
+                        mode = obj.attrs.get('mode', None)
+                        read_items.append((name, file_bytes, mode))
+                        hdf5_attrs, xattrs_json, xattrs_raw = _collect_user_metadata(obj)
+                        if hdf5_attrs or xattrs_json:
+                            all_metadata[name] = (hdf5_attrs, xattrs_json, xattrs_raw)
+                        progress.update(name)
+                    elif isinstance(obj, h5py.Group) and obj.attrs.get('empty_dir'):
+                        empty_dir_names.append(name)
+                h5fobj.visititems(collector)
+
+            # Phase 2: Create empty directories.
+            for name in empty_dir_names:
+                dest_dir_path = os.path.join(extract_dir, name)
+                os.makedirs(dest_dir_path, exist_ok=True)
+                progress.update(name)
+                if verbose_file:
+                    print(f"Created empty dir: {name}")
+
+            # Phase 3: Write files to filesystem in parallel.
+            work_items = [(name, data, mode, extract_dir) for name, data, mode in read_items]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
+                executor.map(_write_extracted_file, work_items)
+            # Restore xattrs after files are written
+            if xattr_flag:
+                for name in all_metadata:
+                    _, _, xattrs_raw = all_metadata[name]
+                    if xattrs_raw:
+                        dest = os.path.join(extract_dir, name)
+                        _restore_xattrs(dest, xattrs_raw)
+            progress.finish()
+            if metadata_json and all_metadata:
+                _write_metadata_json(extract_dir, all_metadata)
+            if verbose_file:
+                for name, _, _, _ in work_items:
+                    print(f"Extracted: {name}")
 
     print("Extraction complete!")
 
@@ -341,6 +554,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Archive, append, extract, or list an HDF5 archive."
     )
+    parser.add_argument("--version", action="version", version="%(prog)s 1.0.0")
+
     # Mutually exclusive operation flags.
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("-c", action="store_true", help="Create archive from one or more directories/files.")
@@ -375,6 +590,12 @@ def main():
     # Checksum.
     parser.add_argument("--checksum", choices=["md5", "sha256", "blake3"],
                         help="Checksum algorithm for integrity verification (md5, sha256, blake3).")
+
+    # Metadata extraction.
+    parser.add_argument("--metadata-json", action="store_true",
+                        help="Write metadata.json manifest of user HDF5 attributes on extraction.")
+    parser.add_argument("--xattr", action="store_true",
+                        help="Capture/restore filesystem extended attributes (user.* namespace).")
 
     # Parallelism.
     parser.add_argument("-p", "--parallel", type=int, default=1,
@@ -464,7 +685,7 @@ def main():
                     validate=args.validate, bagit_raw=args.bagit_raw,
                     verbose=args.verbose)
             elif args.t:
-                mpi_list_bagit(h5_file)
+                mpi_list_bagit(h5_file, bagit_raw=args.bagit_raw)
             return
 
         if args.r:
@@ -487,7 +708,8 @@ def main():
                 batch_size=bs,
                 parallel=args.parallel,
                 verbose=args.verbose,
-                checksum=args.checksum)
+                checksum=args.checksum,
+                xattr_flag=args.xattr)
         elif args.x:
             file_key = sources[0] if sources else None
             extract_bagit(
@@ -496,9 +718,11 @@ def main():
                 validate=args.validate,
                 bagit_raw=args.bagit_raw,
                 parallel=args.parallel,
-                verbose=args.verbose)
+                verbose=args.verbose,
+                metadata_json=args.metadata_json,
+                xattr_flag=args.xattr)
         elif args.t:
-            list_bagit(h5_file)
+            list_bagit(h5_file, bagit_raw=args.bagit_raw)
         else:
             parser.print_help()
             sys.exit(1)
@@ -517,15 +741,19 @@ def main():
                     validate=args.validate,
                     bagit_raw=getattr(args, 'bagit_raw', False),
                     parallel=args.parallel,
-                    verbose=args.verbose)
+                    verbose=args.verbose,
+                    metadata_json=getattr(args, 'metadata_json', False),
+                    xattr_flag=getattr(args, 'xattr', False))
             else:
-                list_bagit(h5_file)
+                list_bagit(h5_file, bagit_raw=getattr(args, 'bagit_raw', False))
         elif args.x:
             file_key = sources[0] if sources else None
             extract_h5_to_directory(h5_file, target_dir, file_key=file_key,
                                     parallel=args.parallel,
                                     verbose=args.verbose,
-                                    validate=args.validate)
+                                    validate=args.validate,
+                                    metadata_json=getattr(args, 'metadata_json', False),
+                                    xattr_flag=getattr(args, 'xattr', False))
         else:
             list_h5_contents(h5_file)
 
@@ -544,7 +772,8 @@ def main():
             shuffle=args.shuffle,
             parallel=args.parallel,
             verbose=args.verbose,
-            checksum=args.checksum)
+            checksum=args.checksum,
+            xattr_flag=args.xattr)
     elif args.r:
         # Append to archive.
         if not sources:
@@ -559,13 +788,16 @@ def main():
             shuffle=args.shuffle,
             parallel=args.parallel,
             verbose=args.verbose,
-            checksum=args.checksum)
+            checksum=args.checksum,
+            xattr_flag=args.xattr)
     elif args.x:
         file_key = sources[0] if sources else None
         extract_h5_to_directory(h5_file, target_dir, file_key=file_key,
                                 parallel=args.parallel,
                                 verbose=args.verbose,
-                                validate=args.validate)
+                                validate=args.validate,
+                                metadata_json=args.metadata_json,
+                                xattr_flag=args.xattr)
     elif args.t:
         list_h5_contents(h5_file)
     else:
