@@ -39,7 +39,6 @@ else ifeq ($(container),docker)
   RUN_STATIC := docker run --rm \
       -v $(RUST_DIR):/work \
       -e CARGO_HOME=/work/.cargo_home \
-      -e RUSTUP_HOME=/work/.rustup_home \
       $(DOCKER_IMAGE_STATIC) bash -c
   WORKDIR := /work
   NEED_DYNAMIC_ENV := rust-sandbox-docker
@@ -168,7 +167,7 @@ rust-sandbox-docker:
 rust-static-sandbox-docker:
 	@if ! docker image inspect $(DOCKER_IMAGE_STATIC) >/dev/null 2>&1; then \
 		echo "Building Docker image $(DOCKER_IMAGE_STATIC) (musl/static)..."; \
-		printf 'FROM rust:1.86-alpine\nRUN apk add --no-cache hdf5-dev hdf5-static musl-dev pkgconf cmake make perl zlib-static && rustup target add x86_64-unknown-linux-musl\nWORKDIR /work\n' \
+		printf 'FROM rust:1.86-alpine\nRUN apk add --no-cache bash hdf5-dev hdf5-static musl-dev pkgconf cmake make perl zlib-static && rustup target add x86_64-unknown-linux-musl\nWORKDIR /work\n' \
 			| docker build -t $(DOCKER_IMAGE_STATIC) -; \
 	else \
 		echo "Docker image $(DOCKER_IMAGE_STATIC) already exists."; \
@@ -199,12 +198,12 @@ build-rust-release: $(NEED_DYNAMIC_ENV)
 	@echo "Built: $(RUST_BIN) (release, dynamic, $(container))"
 
 build-rust-static: $(NEED_STATIC_ENV)
-	$(RUN_STATIC) "cd $(WORKDIR) && RUSTFLAGS='-C target-feature=+crt-static' cargo build --target x86_64-unknown-linux-musl"
+	$(RUN_STATIC) "cd $(WORKDIR) && RUSTFLAGS='-C target-feature=+crt-static' cargo build --features static-hdf5 --target x86_64-unknown-linux-musl"
 	cp $(RUST_DIR)/target/x86_64-unknown-linux-musl/debug/har $(RUST_BIN_STATIC)
 	@echo "Built: $(RUST_BIN_STATIC) (debug, static, $(container))"
 
 build-rust-release-static: $(NEED_STATIC_ENV)
-	$(RUN_STATIC) "cd $(WORKDIR) && RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target x86_64-unknown-linux-musl"
+	$(RUN_STATIC) "cd $(WORKDIR) && RUSTFLAGS='-C target-feature=+crt-static' cargo build --features static-hdf5 --release --target x86_64-unknown-linux-musl"
 	cp $(RUST_DIR)/target/x86_64-unknown-linux-musl/release/har $(RUST_BIN_STATIC)
 	@echo "Built: $(RUST_BIN_STATIC) (release, static, $(container))"
 
