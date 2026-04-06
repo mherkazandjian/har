@@ -389,14 +389,22 @@ pub fn pack_bagit(
         .write_scalar(&(file_count as u64)).unwrap();
 
     // Batch datasets
+    let is_lzma = compression == Some("lzma");
     let batches_grp = h5f.create_group("batches").unwrap();
     for batch in &batches {
         let mut buf = vec![0u8; batch.total_bytes];
         for f in &batch.files {
             buf[f.offset..f.offset + f.content.len()].copy_from_slice(&f.content);
         }
-        let mut builder = batches_grp.new_dataset::<u8>();
-        let mut builder = builder.shape(buf.len());
+        let write_buf;
+        let data = if is_lzma {
+            write_buf = crate::lzma_compress(&buf);
+            &write_buf[..]
+        } else {
+            &buf[..]
+        };
+        let builder = batches_grp.new_dataset::<u8>();
+        let mut builder = builder.shape(data.len());
         if shuffle {
             builder = builder.shuffle();
         }
@@ -405,7 +413,11 @@ pub fn pack_bagit(
         }
         let batch_name = batch.id.to_string();
         let ds = builder.create(batch_name.as_str()).unwrap();
-        ds.write_raw(&buf).unwrap();
+        ds.write_raw(data).unwrap();
+        if is_lzma {
+            ds.new_attr::<u8>().shape(()).create("har_lzma").unwrap()
+                .write_scalar(&1u8).unwrap();
+        }
 
         if verbose {
             println!("  Wrote batch {}: {} files, {}",
@@ -496,8 +508,8 @@ pub fn extract_bagit(
                 let off = offsets[i] as usize;
                 let len = lengths[i] as usize;
                 let mode = modes[i];
-                let batch_data: Vec<u8> = h5f.dataset(&format!("batches/{}", bid))
-                    .unwrap().read_raw().unwrap();
+                let batch_ds = h5f.dataset(&format!("batches/{}", bid)).unwrap();
+                let batch_data = crate::read_dataset_content(&batch_ds);
                 let file_bytes = &batch_data[off..off + len];
 
                 let out_path = if bagit_raw { &lookup } else { lookup.strip_prefix("data/").unwrap_or(&lookup) };
@@ -533,8 +545,8 @@ pub fn extract_bagit(
     let mut errors = Vec::new();
 
     for (bid, indices) in &by_batch {
-        let batch_data: Vec<u8> = h5f.dataset(&format!("batches/{}", bid))
-            .unwrap().read_raw().unwrap();
+        let batch_ds = h5f.dataset(&format!("batches/{}", bid)).unwrap();
+        let batch_data = crate::read_dataset_content(&batch_ds);
 
         if parallel <= 1 {
             for &i in indices {

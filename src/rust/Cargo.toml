@@ -16,6 +16,7 @@ walkdir = "2"
 shellexpand = "3"
 pathdiff = "0.2"
 sha2 = "0.10"
+lzma-rs = "0.3"
 chrono = "0.4"
 
 [features]

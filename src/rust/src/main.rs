@@ -39,6 +39,10 @@ struct Cli {
     #[arg(long = "szip")]
     szip: bool,
 
+    /// Use LZMA compression (application-level, no HDF5 filter plugin needed)
+    #[arg(long = "lzma")]
+    lzma: bool,
+
     /// Compression level for gzip 1-9 (default: 9)
     #[arg(long = "zopt", default_value = "9")]
     zopt: String,
@@ -93,6 +97,8 @@ fn main() {
     } else if cli.szip {
         eprintln!("warning: szip compression is not tested yet");
         (Some("szip"), None)
+    } else if cli.lzma {
+        (Some("lzma"), None)
     } else {
         (None, None)
     };

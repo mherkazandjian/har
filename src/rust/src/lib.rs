@@ -7,6 +7,28 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use walkdir::WalkDir;
 
+/// Compress data with LZMA.
+pub fn lzma_compress(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    lzma_rs::lzma_compress(
+        &mut io::BufReader::new(data),
+        &mut out,
+    )
+    .expect("LZMA compression failed");
+    out
+}
+
+/// Decompress LZMA-compressed data.
+pub fn lzma_decompress(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    lzma_rs::lzma_decompress(
+        &mut io::BufReader::new(data),
+        &mut out,
+    )
+    .expect("LZMA decompression failed");
+    out
+}
+
 /// Entry collected during the inventory phase.
 struct FileEntry {
     file_path: PathBuf,
@@ -26,6 +48,22 @@ fn read_file(path: &Path) -> io::Result<(Vec<u8>, u32)> {
     fs::File::open(path)?.read_to_end(&mut content)?;
     let mode = fs::metadata(path)?.permissions().mode();
     Ok((content, mode))
+}
+
+/// Read dataset content, automatically decompressing LZMA if marked.
+pub fn read_dataset_content(ds: &hdf5::Dataset) -> Vec<u8> {
+    let data: Vec<u8> = ds.read_raw().expect("Failed to read dataset");
+    let is_lzma = ds
+        .attr("har_lzma")
+        .ok()
+        .and_then(|a| a.read_scalar::<u8>().ok())
+        .map(|v| v != 0)
+        .unwrap_or(false);
+    if is_lzma {
+        lzma_decompress(&data)
+    } else {
+        data
+    }
 }
 
 /// Write extracted file to disk.
@@ -74,8 +112,17 @@ fn create_dataset(
     compression_opts: Option<u8>,
     shuffle: bool,
 ) -> hdf5::Dataset {
+    let is_lzma = compression == Some("lzma");
+    let write_data;
+    let data = if is_lzma {
+        write_data = lzma_compress(content);
+        &write_data[..]
+    } else {
+        content
+    };
+
     let builder = h5f.new_dataset::<u8>();
-    let mut builder = builder.shape(content.len());
+    let mut builder = builder.shape(data.len());
 
     if shuffle {
         builder = builder.shuffle();
@@ -95,8 +142,18 @@ fn create_dataset(
     let ds = builder
         .create(rel_path)
         .unwrap_or_else(|e| panic!("Failed to create dataset '{}': {}", rel_path, e));
-    ds.write_raw(content)
+    ds.write_raw(data)
         .unwrap_or_else(|e| panic!("Failed to write dataset '{}': {}", rel_path, e));
+
+    if is_lzma {
+        ds.new_attr::<u8>()
+            .shape(())
+            .create("har_lzma")
+            .expect("Failed to create har_lzma attr")
+            .write_scalar(&1u8)
+            .expect("Failed to write har_lzma attr");
+    }
+
     ds
 }
 
@@ -358,7 +415,7 @@ pub fn extract_h5_to_directory(
     if let Some(key) = file_key {
         match h5f.dataset(key) {
             Ok(ds) => {
-                let data: Vec<u8> = ds.read_raw().expect("Failed to read dataset");
+                let data = read_dataset_content(&ds);
                 let mode = ds
                     .attr("mode")
                     .ok()
@@ -379,7 +436,7 @@ pub fn extract_h5_to_directory(
             match obj_type {
                 H5ObjType::Dataset => {
                     let ds = h5f.dataset(&name).expect("Failed to open dataset");
-                    let data: Vec<u8> = ds.read_raw().expect("Failed to read dataset");
+                    let data = read_dataset_content(&ds);
                     let mode = ds
                         .attr("mode")
                         .ok()
@@ -408,7 +465,7 @@ pub fn extract_h5_to_directory(
             match obj_type {
                 H5ObjType::Dataset => {
                     let ds = h5f.dataset(&name).expect("Failed to open dataset");
-                    let data: Vec<u8> = ds.read_raw().expect("Failed to read dataset");
+                    let data = read_dataset_content(&ds);
                     let mode = ds
                         .attr("mode")
                         .ok()
