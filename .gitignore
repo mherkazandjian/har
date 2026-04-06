@@ -125,6 +125,17 @@ cython_debug/
 # VS Code
 .vscode/
 
+# SLURM job output
+tests/mpi_test_*.out
+tests/mpi_test_*.err
+tests/mpi_bw_*.out
+tests/mpi_bw_*.err
+tests/mpi_shm_*.out
+tests/mpi_shm_*.err
+
+# Benchmark artifacts
+bench_*.h5
+
 # Rust
 ## Build artifacts
 src/rust/target/

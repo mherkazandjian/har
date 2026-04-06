@@ -67,7 +67,14 @@ clean:
 test: test-python test-rust
 
 test-python:
-	python -m pytest tests/
+	python -m pytest tests/test_h5.py tests/test_bagit.py
+
+test-bagit:
+	python -m pytest tests/test_bagit.py -v
+
+test-mpi:
+	module load h5py/3.14.0-foss-2025a && \
+	mpirun -np 4 python -m pytest tests/test_h5_mpi.py -v
 
 # ---------------------------------------------------------------------------
 # Rust sandboxes

@@ -55,6 +55,22 @@ struct Cli {
     #[arg(short = 'v', long = "verbose")]
     verbose: bool,
 
+    /// Use BagIt batched storage mode (faster for many files, adds SHA-256 checksums)
+    #[arg(long = "bagit")]
+    bagit: bool,
+
+    /// Target batch size for --bagit mode (default: 64M)
+    #[arg(long = "batch-size", default_value = "64M")]
+    batch_size: String,
+
+    /// Verify SHA-256 checksums on extraction (--bagit mode only)
+    #[arg(long = "validate")]
+    validate: bool,
+
+    /// Extract as a full BagIt bag with tag files (--bagit mode only)
+    #[arg(long = "bagit-raw")]
+    bagit_raw: bool,
+
     /// Source directories/files (for -c/-r) or file key to extract (for -x)
     #[arg(trailing_var_arg = true)]
     path: Vec<String>,
@@ -81,6 +97,53 @@ fn main() {
         (None, None)
     };
 
+    // --- BagIt mode ---
+    if cli.bagit {
+        let bs = har::bagit::parse_batch_size(&cli.batch_size);
+
+        if cli.append {
+            eprintln!("Error: Append (-r) is not supported with --bagit.");
+            std::process::exit(1);
+        }
+
+        if cli.create {
+            if cli.path.is_empty() {
+                eprintln!("Error: At least one source is required for archive creation (-c).");
+                std::process::exit(1);
+            }
+            let sources: Vec<&str> = cli.path.iter().map(|s| s.as_str()).collect();
+            har::bagit::pack_bagit(
+                &sources, &cli.file, compression, compression_opts,
+                cli.shuffle, bs, cli.parallel, cli.verbose,
+            );
+        } else if cli.extract {
+            let file_key = if cli.path.is_empty() { None } else { Some(cli.path[0].as_str()) };
+            har::bagit::extract_bagit(
+                &cli.file, &cli.directory, file_key,
+                cli.validate, cli.bagit_raw, cli.parallel, cli.verbose,
+            );
+        } else if cli.list {
+            har::bagit::list_bagit(&cli.file);
+        }
+        return;
+    }
+
+    // --- Auto-detect bagit on extract/list ---
+    if (cli.extract || cli.list) && har::bagit::is_bagit_archive(&cli.file) {
+        eprintln!("Note: detected bagit-v1 archive, using BagIt extraction.");
+        if cli.extract {
+            let file_key = if cli.path.is_empty() { None } else { Some(cli.path[0].as_str()) };
+            har::bagit::extract_bagit(
+                &cli.file, &cli.directory, file_key,
+                cli.validate, cli.bagit_raw, cli.parallel, cli.verbose,
+            );
+        } else {
+            har::bagit::list_bagit(&cli.file);
+        }
+        return;
+    }
+
+    // --- Legacy mode ---
     if cli.create {
         if cli.path.is_empty() {
             eprintln!("Error: At least one source (directory or file) is required for archive creation (-c).");
@@ -88,14 +151,8 @@ fn main() {
         }
         let sources: Vec<&str> = cli.path.iter().map(|s| s.as_str()).collect();
         har::pack_or_append_to_h5(
-            &sources,
-            &cli.file,
-            "w",
-            compression,
-            compression_opts,
-            cli.shuffle,
-            cli.parallel,
-            cli.verbose,
+            &sources, &cli.file, "w", compression, compression_opts,
+            cli.shuffle, cli.parallel, cli.verbose,
         );
     } else if cli.append {
         if cli.path.is_empty() {
@@ -104,27 +161,13 @@ fn main() {
         }
         let sources: Vec<&str> = cli.path.iter().map(|s| s.as_str()).collect();
         har::pack_or_append_to_h5(
-            &sources,
-            &cli.file,
-            "a",
-            compression,
-            compression_opts,
-            cli.shuffle,
-            cli.parallel,
-            cli.verbose,
+            &sources, &cli.file, "a", compression, compression_opts,
+            cli.shuffle, cli.parallel, cli.verbose,
         );
     } else if cli.extract {
-        let file_key = if cli.path.is_empty() {
-            None
-        } else {
-            Some(cli.path[0].as_str())
-        };
+        let file_key = if cli.path.is_empty() { None } else { Some(cli.path[0].as_str()) };
         har::extract_h5_to_directory(
-            &cli.file,
-            &cli.directory,
-            file_key,
-            cli.parallel,
-            cli.verbose,
+            &cli.file, &cli.directory, file_key, cli.parallel, cli.verbose,
         );
     } else if cli.list {
         har::list_h5_contents(&cli.file);

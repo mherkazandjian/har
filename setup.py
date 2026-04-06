@@ -10,6 +10,9 @@ setup(
         'h5py',
         'numpy',
     ],
+    extras_require={
+        'mpi': ['mpi4py>=3.0'],
+    },
     entry_points={
         'console_scripts': [
             'har=har:main',

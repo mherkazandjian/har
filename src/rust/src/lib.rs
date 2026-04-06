@@ -483,5 +483,7 @@ pub fn list_h5_contents(h5_path: &str) {
     }
 }
 
+pub mod bagit;
+
 #[cfg(test)]
 mod tests;

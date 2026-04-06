@@ -332,6 +332,18 @@ def main():
     parser.add_argument("-p", "--parallel", type=int, default=1,
                         help="Number of parallel workers (default: 1 = sequential).")
 
+    # BagIt mode.
+    parser.add_argument("--bagit", action="store_true",
+                        help="Use BagIt batched storage mode (faster for many files, adds SHA-256 checksums).")
+    parser.add_argument("--batch-size", type=str, default="64M",
+                        help="Target batch size for --bagit mode (default: 64M). Examples: 64M, 1G.")
+    parser.add_argument("--validate", action="store_true",
+                        help="Verify SHA-256 checksums on extraction (--bagit mode only).")
+    parser.add_argument("--bagit-raw", action="store_true",
+                        help="Extract as a full BagIt bag with tag files (--bagit mode only).")
+    parser.add_argument("--mpi", action="store_true",
+                        help="Use MPI parallel HDF5 I/O (requires mpirun, mpi4py, parallel h5py).")
+
     # Positional argument:
     # For -c and -r: one or more source directories or files.
     # For -x: optionally, the file key to extract (if omitted, extract entire archive).
@@ -375,7 +387,98 @@ def main():
     else:
         pass
 
-    if args.c:
+    # --- BagIt mode dispatch ---
+    if args.bagit or args.mpi:
+        from har_bagit import pack_bagit, extract_bagit, list_bagit, parse_batch_size
+
+        if args.mpi:
+            from har_mpi import mpi_pack_bagit, mpi_extract_bagit, mpi_list_bagit
+
+            if args.r:
+                print("Error: Append (-r) is not supported with --bagit.",
+                      file=sys.stderr)
+                sys.exit(1)
+            if compression:
+                print("Warning: Compression is not supported with MPI parallel "
+                      "HDF5 I/O. Compression flags ignored.", file=sys.stderr)
+
+            if args.c:
+                if not sources:
+                    print("Error: At least one source is required.", file=sys.stderr)
+                    sys.exit(1)
+                mpi_pack_bagit(sources, h5_file, batch_size=bs, verbose=args.verbose)
+            elif args.x:
+                file_key = sources[0] if sources else None
+                mpi_extract_bagit(
+                    h5_file, target_dir, file_key=file_key,
+                    validate=args.validate, bagit_raw=args.bagit_raw,
+                    verbose=args.verbose)
+            elif args.t:
+                mpi_list_bagit(h5_file)
+            return
+
+        if args.r:
+            print("Error: Append (-r) is not supported with --bagit "
+                  "(manifests include checksums of all files).", file=sys.stderr)
+            sys.exit(1)
+
+        bs = parse_batch_size(args.batch_size)
+
+        if args.c:
+            if not sources:
+                print("Error: At least one source is required for archive creation (-c).",
+                      file=sys.stderr)
+                sys.exit(1)
+            pack_bagit(
+                sources, h5_file,
+                compression=compression,
+                compression_opts=compression_opts,
+                shuffle=args.shuffle,
+                batch_size=bs,
+                parallel=args.parallel,
+                verbose=args.verbose)
+        elif args.x:
+            file_key = sources[0] if sources else None
+            extract_bagit(
+                h5_file, target_dir,
+                file_key=file_key,
+                validate=args.validate,
+                bagit_raw=args.bagit_raw,
+                parallel=args.parallel,
+                verbose=args.verbose)
+        elif args.t:
+            list_bagit(h5_file)
+        else:
+            parser.print_help()
+            sys.exit(1)
+
+    # --- Auto-detect bagit format on extract/list ---
+    elif (args.x or args.t) and os.path.exists(os.path.expanduser(h5_file)):
+        from har_bagit import is_bagit_archive, extract_bagit, list_bagit
+        if is_bagit_archive(h5_file):
+            print("Note: detected bagit-v1 archive, using BagIt extraction.",
+                  file=sys.stderr)
+            if args.x:
+                file_key = sources[0] if sources else None
+                extract_bagit(
+                    h5_file, target_dir,
+                    file_key=file_key,
+                    validate=args.validate,
+                    bagit_raw=getattr(args, 'bagit_raw', False),
+                    parallel=args.parallel,
+                    verbose=args.verbose)
+            else:
+                list_bagit(h5_file)
+        elif args.x:
+            file_key = sources[0] if sources else None
+            extract_h5_to_directory(h5_file, target_dir, file_key=file_key,
+                                    parallel=args.parallel,
+                                    verbose=args.verbose)
+        else:
+            list_h5_contents(h5_file)
+
+    # --- Legacy mode ---
+    elif args.c:
         # Create archive.
         if not sources:
             print("Error: At least one source (directory or file) is required for archive creation (-c).", file=sys.stderr)
@@ -404,14 +507,11 @@ def main():
             parallel=args.parallel,
             verbose=args.verbose)
     elif args.x:
-        # Extract from archive.
-        # If sources is not empty, treat the first source as the file key.
         file_key = sources[0] if sources else None
         extract_h5_to_directory(h5_file, target_dir, file_key=file_key,
                                 parallel=args.parallel,
                                 verbose=args.verbose)
     elif args.t:
-        # List contents.
         list_h5_contents(h5_file)
     else:
         parser.print_help()

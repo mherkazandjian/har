@@ -90,13 +90,151 @@ har -cvzf archive.h5 -p 16 --shuffle mydir
 
 ## Benchmarks
 
-100,000 small files (29 MB total) on GPFS:
+*(in progress)*
 
-| Operation       | tar     | har -p 1 | har -p 8 | har -p 16 |
-|-----------------|---------|----------|----------|-----------|
-| Create archive  | 99s     | 244s     | 79s      | **67s**   |
-| Extract archive | **38s** | 99s      | 48s      | 48s       |
-| Archive size    | 99 MB   | 64 MB    | 64 MB    | **64 MB** |
+## BagIt mode (`--bagit`)
+
+BagIt mode stores files in **batched datasets** instead of one HDF5 dataset per
+file. This eliminates per-file metadata overhead and embeds
+[RFC 8493](https://datatracker.ietf.org/doc/html/rfc8493) manifests (SHA-256
+checksums, bag-info) inside the archive.
+
+### Why batching matters
+
+With the default (legacy) mode, archiving 100k files creates 100k HDF5 datasets
+— each `create_dataset` call has fixed metadata overhead (~0.5 ms), totalling
+~50 s before a single byte of data is written. BagIt mode concatenates files
+into a small number of large batch datasets (~64 MB each by default) and stores
+a compact index for random-access lookup. 100k files become ~50 batches + 1
+index dataset instead of 100k datasets.
+
+### HDF5 layout
+
+```
+/ (root)
+  @har_format = "bagit-v1"
+  /index          — compound dataset (path, batch_id, offset, length, mode, sha256)
+  /batches/0      — uint8 dataset (concatenated file bytes, ~64 MB)
+  /batches/1
+  ...
+  /bagit/
+    bagit.txt
+    bag-info.txt
+    manifest-sha256.txt
+    tagmanifest-sha256.txt
+  /empty_dirs     — empty directory paths
+```
+
+### Usage
+
+```sh
+# create a BagIt archive
+har --bagit -cf archive.h5 mydir
+
+# create with custom batch size and parallel reads
+har --bagit --batch-size 128M -cf archive.h5 -p 8 mydir
+
+# create with gzip compression
+har --bagit -czf archive.h5 mydir
+
+# extract (auto-detects bagit format, --bagit flag optional)
+har -xf archive.h5 -C output/
+
+# extract a single file (indexed lookup, no scanning)
+har --bagit -xf archive.h5 mydir/subdir/file.txt
+
+# extract with SHA-256 validation
+har --bagit --validate -xf archive.h5 -C output/
+
+# extract as a full RFC 8493 BagIt bag (with tag files)
+har --bagit --bagit-raw -xf archive.h5 -C output/
+
+# list contents
+har --bagit -tf archive.h5
+```
+
+### BagIt-specific flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--bagit` | off | Enable BagIt batched storage mode |
+| `--batch-size` | `64M` | Target batch size (e.g. `64M`, `1G`) |
+| `--validate` | off | Verify SHA-256 checksums on extraction |
+| `--bagit-raw` | off | Extract as a full BagIt bag with tag files |
+
+### Notes
+
+- **Append (`-r`) is not supported** with `--bagit` — manifests include
+  checksums of all files, so appending would require recomputing everything.
+  Re-create the archive instead.
+- **Auto-detection**: extracting or listing a bagit-v1 archive works without
+  the `--bagit` flag — har detects the format from the `har_format` root
+  attribute.
+- On extraction, the `data/` BagIt prefix is stripped by default so the
+  original directory tree is reproduced exactly. Use `--bagit-raw` to get
+  the full BagIt directory with tag files.
+
+## MPI parallel HDF5 I/O (`--mpi`) — experimental
+
+For large-scale archiving on HPC systems, har supports MPI parallel HDF5 using
+the `mpio` driver. Multiple MPI ranks write concurrently to a single `.h5` file.
+
+**This feature is experimental.** The API and behavior may change.
+
+MPI mode requires `--bagit` (batched datasets are the natural parallelism
+boundary) and a parallel-enabled h5py + mpi4py environment.
+
+### How it works
+
+```
+Phase 1  Rank 0 inventories the filesystem, broadcasts the file list
+Phase 2  Each rank reads + SHA-256 checksums its assigned files
+Phase 3  All ranks collectively open the HDF5 file (driver='mpio')
+Phase 4  All ranks collectively create batch datasets (HDF5 requirement)
+Phase 5  Each rank independently writes its owned batch data
+Phase 6  Rank 0 writes the index + BagIt manifests
+Phase 7  All ranks collectively close the file
+```
+
+Files are assigned to ranks by **batch ownership** (not round-robin by file),
+so each rank reads all files for its batches and writes the full batch buffer.
+This avoids data shuffling between ranks.
+
+### Usage
+
+```sh
+# load MPI-enabled h5py (example for Snellius)
+module load h5py/3.14.0-foss-2025a
+
+# create archive with 8 MPI ranks
+mpirun -np 8 har --bagit --mpi -cf archive.h5 mydir
+
+# extract with 8 MPI ranks
+mpirun -np 8 har --bagit --mpi -xf archive.h5 -C output/
+
+# list contents (rank 0 only)
+mpirun -np 1 har --bagit --mpi -tf archive.h5
+```
+
+### SLURM example
+
+```bash
+#!/bin/bash
+#SBATCH --nodes=1 --ntasks=16 --time=00:30:00
+
+module purge && module load 2025 h5py/3.14.0-foss-2025a
+srun python -m har --bagit --mpi -cf archive.h5 /path/to/data
+```
+
+### Limitations
+
+- **Compression is not supported** with MPI parallel HDF5 (HDF5 library
+  limitation). If `-z`/`--lzf`/`--szip` is combined with `--mpi`, the
+  compression flags are ignored with a warning. Use `h5repack -f GZIP=9`
+  for post-hoc compression.
+- **Python only** — the Rust hdf5 crate v0.8 does not expose MPI bindings.
+- **Single node** — currently tested with multiple ranks on one node. Multi-node
+  requires a shared filesystem (GPFS/Lustre) visible to all ranks.
 
 ## License
 
