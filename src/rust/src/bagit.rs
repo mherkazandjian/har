@@ -3,6 +3,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
 use std::time::Instant;
 use walkdir::WalkDir;
 
@@ -303,8 +305,13 @@ pub fn pack_bagit(
         println!("Batches: {} (target {})", batches.len(), human_size(batch_size));
     }
 
-    let mut progress = crate::Progress::new(verbose);
-    progress.start_phase("Archiving", total_size);
+    let mut progress = crate::PipelineProgress::new(verbose);
+    // Discovery is synchronous (fast) — mark as instantly complete
+    progress.discovery.files_found.store(file_count as u64, Ordering::Relaxed);
+    progress.discovery.bytes_found.store(total_size, Ordering::Relaxed);
+    progress.discovery.done.store(true, Ordering::Release);
+    progress.finish_discovery();
+    progress.archive_total = total_size;
     let verbose_file = verbose && !progress.is_tty;
 
     // 4. Stream: read+hash+write one batch at a time
@@ -340,27 +347,95 @@ pub fn pack_bagit(
 
     let batches_grp = h5f.create_group("batches").unwrap();
 
+    // Build a flat list of upcoming file (name, size) for the queued display
+    let all_file_info: Vec<(String, u64)> = batches.iter()
+        .flat_map(|b| {
+            b.files.iter().enumerate().map(move |(i, f)| {
+                let size = if i + 1 < b.files.len() {
+                    (b.files[i + 1].offset - f.offset) as u64
+                } else {
+                    (b.total_bytes - f.offset) as u64
+                };
+                (f.rel_path.clone(), size)
+            })
+        })
+        .collect();
+    let mut global_file_idx: usize = 0;
+
     for batch in &batches {
-        let mut batch_buffer = vec![0u8; batch.total_bytes];
         let mut batch_records: Vec<IndexRecord> = Vec::new();
 
-        if parallel <= 1 {
+        if parallel <= 1 && !is_lzma {
+            // --- Pipelined sequential path: chunked read/write per file ---
+            // Create batch dataset with chunked storage for streaming writes
+            let chunk_ds_size = crate::READ_CHUNK.min(batch.total_bytes.max(1));
+            let mut builder = batches_grp.new_dataset::<u8>()
+                .shape(batch.total_bytes)
+                .chunk(chunk_ds_size);
+            if shuffle {
+                builder = builder.shuffle();
+            }
+            if let Some("gzip") = compression {
+                builder = builder.deflate(compression_opts.unwrap_or(4));
+            }
+            let batch_name = batch.id.to_string();
+            let batch_ds = builder.create(batch_name.as_str()).unwrap();
+
             for f in &batch.files {
-                let hr = read_and_hash(&f.file_path, hash_algo).expect("Failed to read file");
+                let file_size = fs::metadata(&f.file_path).map(|m| m.len()).unwrap_or(0);
+
+                // Update queued display
+                let queued_names: Vec<(String, u64)> = all_file_info.iter()
+                    .skip(global_file_idx + 1)
+                    .take(3)
+                    .cloned()
+                    .collect();
+                progress.set_queued(&queued_names);
+                progress.begin_file(&f.rel_path, file_size);
+
+                let file_meta = crate::read_file_meta(&f.file_path).expect("Failed to stat file");
+
+                // Spawn reader thread — reads file in 1MiB chunks
+                let (chunk_tx, chunk_rx) = mpsc::sync_channel::<Vec<u8>>(4);
+                let read_path = f.file_path.clone();
+                let reader = std::thread::spawn(move || {
+                    let mut file = fs::File::open(&read_path)
+                        .expect("Failed to open file for reading");
+                    let mut buf = vec![0u8; crate::READ_CHUNK];
+                    loop {
+                        let n = file.read(&mut buf).expect("Failed to read file chunk");
+                        if n == 0 { break; }
+                        if chunk_tx.send(buf[..n].to_vec()).is_err() { break; }
+                    }
+                });
+
+                // Main thread: write chunks into batch dataset at file's offset
+                let file_base_offset = f.offset;
+                let mut write_offset: usize = 0;
+                let mut hasher = crate::StreamHasher::new(hash_algo);
+                for chunk in chunk_rx.iter() {
+                    let chunk_len = chunk.len();
+                    hasher.update(&chunk);
+                    crate::write_dataset_chunk(&batch_ds, &chunk, file_base_offset + write_offset);
+                    write_offset += chunk_len;
+                    progress.update_file_progress(write_offset as u64);
+                }
+                reader.join().expect("Reader thread panicked");
+
+                let hash = hasher.finalize_hex();
                 let bagit_path = format!("data/{}", f.rel_path);
-                let content_len = hr.content.len();
-                batch_buffer[f.offset..f.offset + content_len].copy_from_slice(&hr.content);
                 batch_records.push(IndexRecord {
                     bagit_path: bagit_path.clone(),
                     batch_id: batch.id,
                     offset: f.offset as u64,
-                    length: content_len as u64,
-                    mode: hr.mode,
-                    sha256: hr.hash.clone(),
-                    uid: hr.uid, gid: hr.gid, mtime: hr.mtime,
-                    owner: hr.owner, group: hr.group,
+                    length: write_offset as u64,
+                    mode: file_meta.mode,
+                    sha256: hash.clone(),
+                    uid: file_meta.uid, gid: file_meta.gid, mtime: file_meta.mtime,
+                    owner: file_meta.owner, group: file_meta.group,
                 });
-                manifest_records.push((bagit_path, hr.hash));
+                manifest_records.push((bagit_path, hash));
+
                 if xattr_flag {
                     let xattrs = crate::metadata::read_xattrs(&f.file_path);
                     if !xattrs.is_empty() {
@@ -375,90 +450,144 @@ pub fn pack_bagit(
                         user_metadata_map.insert(f.rel_path.clone(), entry);
                     }
                 }
-                progress.inc(&f.rel_path, content_len as u64);
+
+                progress.finish_file(write_offset as u64);
+                global_file_idx += 1;
                 if verbose_file {
                     println!("  {}", f.rel_path);
                 }
             }
         } else {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(parallel)
-                .build()
-                .expect("Failed to build thread pool");
-            let results: Vec<(usize, HashResult)> = pool.install(|| {
-                batch.files
-                    .par_iter()
-                    .enumerate()
-                    .map(|(i, f)| {
-                        let hr = read_and_hash(&f.file_path, hash_algo).expect("Failed to read file");
-                        (i, hr)
-                    })
-                    .collect()
-            });
-            for (i, hr) in results {
-                let f = &batch.files[i];
-                let bagit_path = format!("data/{}", f.rel_path);
-                let content_len = hr.content.len();
-                batch_buffer[f.offset..f.offset + content_len].copy_from_slice(&hr.content);
-                batch_records.push(IndexRecord {
-                    bagit_path: bagit_path.clone(),
-                    batch_id: batch.id,
-                    offset: f.offset as u64,
-                    length: content_len as u64,
-                    mode: hr.mode,
-                    sha256: hr.hash.clone(),
-                    uid: hr.uid, gid: hr.gid, mtime: hr.mtime,
-                    owner: hr.owner, group: hr.group,
-                });
-                manifest_records.push((bagit_path, hr.hash));
-                if xattr_flag {
-                    let xattrs = crate::metadata::read_xattrs(&f.file_path);
-                    if !xattrs.is_empty() {
-                        use base64::Engine;
-                        let mut xmap = serde_json::Map::new();
-                        for (name, value) in &xattrs {
-                            let encoded = base64::engine::general_purpose::STANDARD.encode(value);
-                            xmap.insert(name.clone(), serde_json::json!(format!("base64:{}", encoded)));
+            // --- Parallel or LZMA path: buffer entire batch then write ---
+            let mut batch_buffer = vec![0u8; batch.total_bytes];
+
+            if parallel <= 1 {
+                for f in &batch.files {
+                    let file_size = fs::metadata(&f.file_path).map(|m| m.len()).unwrap_or(0);
+                    let queued_names: Vec<(String, u64)> = all_file_info.iter()
+                        .skip(global_file_idx + 1)
+                        .take(3)
+                        .cloned()
+                        .collect();
+                    progress.set_queued(&queued_names);
+                    progress.begin_file(&f.rel_path, file_size);
+
+                    let hr = read_and_hash(&f.file_path, hash_algo).expect("Failed to read file");
+                    let bagit_path = format!("data/{}", f.rel_path);
+                    let content_len = hr.content.len();
+                    batch_buffer[f.offset..f.offset + content_len].copy_from_slice(&hr.content);
+                    batch_records.push(IndexRecord {
+                        bagit_path: bagit_path.clone(),
+                        batch_id: batch.id,
+                        offset: f.offset as u64,
+                        length: content_len as u64,
+                        mode: hr.mode,
+                        sha256: hr.hash.clone(),
+                        uid: hr.uid, gid: hr.gid, mtime: hr.mtime,
+                        owner: hr.owner, group: hr.group,
+                    });
+                    manifest_records.push((bagit_path, hr.hash));
+                    if xattr_flag {
+                        let xattrs = crate::metadata::read_xattrs(&f.file_path);
+                        if !xattrs.is_empty() {
+                            use base64::Engine;
+                            let mut xmap = serde_json::Map::new();
+                            for (name, value) in &xattrs {
+                                let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+                                xmap.insert(name.clone(), serde_json::json!(format!("base64:{}", encoded)));
+                            }
+                            let mut entry = serde_json::Map::new();
+                            entry.insert("xattrs".to_string(), serde_json::Value::Object(xmap));
+                            user_metadata_map.insert(f.rel_path.clone(), entry);
                         }
-                        let mut meta_entry = serde_json::Map::new();
-                        meta_entry.insert("xattrs".to_string(), serde_json::Value::Object(xmap));
-                        user_metadata_map.insert(f.rel_path.clone(), meta_entry);
+                    }
+                    progress.finish_file(content_len as u64);
+                    global_file_idx += 1;
+                    if verbose_file {
+                        println!("  {}", f.rel_path);
                     }
                 }
-                progress.inc(&f.rel_path, content_len as u64);
-                if verbose_file {
-                    println!("  {}", f.rel_path);
+            } else {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(parallel)
+                    .build()
+                    .expect("Failed to build thread pool");
+                let results: Vec<(usize, HashResult)> = pool.install(|| {
+                    batch.files
+                        .par_iter()
+                        .enumerate()
+                        .map(|(i, f)| {
+                            let hr = read_and_hash(&f.file_path, hash_algo).expect("Failed to read file");
+                            (i, hr)
+                        })
+                        .collect()
+                });
+                for (i, hr) in results {
+                    let f = &batch.files[i];
+                    let bagit_path = format!("data/{}", f.rel_path);
+                    let content_len = hr.content.len();
+                    batch_buffer[f.offset..f.offset + content_len].copy_from_slice(&hr.content);
+                    batch_records.push(IndexRecord {
+                        bagit_path: bagit_path.clone(),
+                        batch_id: batch.id,
+                        offset: f.offset as u64,
+                        length: content_len as u64,
+                        mode: hr.mode,
+                        sha256: hr.hash.clone(),
+                        uid: hr.uid, gid: hr.gid, mtime: hr.mtime,
+                        owner: hr.owner, group: hr.group,
+                    });
+                    manifest_records.push((bagit_path, hr.hash));
+                    if xattr_flag {
+                        let xattrs = crate::metadata::read_xattrs(&f.file_path);
+                        if !xattrs.is_empty() {
+                            use base64::Engine;
+                            let mut xmap = serde_json::Map::new();
+                            for (name, value) in &xattrs {
+                                let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+                                xmap.insert(name.clone(), serde_json::json!(format!("base64:{}", encoded)));
+                            }
+                            let mut meta_entry = serde_json::Map::new();
+                            meta_entry.insert("xattrs".to_string(), serde_json::Value::Object(xmap));
+                            user_metadata_map.insert(f.rel_path.clone(), meta_entry);
+                        }
+                    }
+                    progress.finish_file(content_len as u64);
+                    global_file_idx += 1;
+                    if verbose_file {
+                        println!("  {}", f.rel_path);
+                    }
                 }
             }
+
+            // Write buffered batch to HDF5
+            let write_buf;
+            let data = if is_lzma {
+                write_buf = crate::lzma_compress(&batch_buffer);
+                &write_buf[..]
+            } else {
+                &batch_buffer[..]
+            };
+            let builder = batches_grp.new_dataset::<u8>();
+            let mut builder = builder.shape(data.len());
+            if shuffle {
+                builder = builder.shuffle();
+            }
+            if let Some("gzip") = compression {
+                builder = builder.deflate(compression_opts.unwrap_or(4));
+            }
+            let batch_name = batch.id.to_string();
+            let ds = builder.create(batch_name.as_str()).unwrap();
+            ds.write_raw(data).unwrap();
+            if is_lzma {
+                ds.new_attr::<u8>().shape(()).create("har_lzma").unwrap()
+                    .write_scalar(&1u8).unwrap();
+            }
+            drop(batch_buffer);
         }
 
         index_records.extend(batch_records);
         total_bytes += batch.total_bytes;
-
-        // Write this batch to HDF5 and free buffer
-        let write_buf;
-        let data = if is_lzma {
-            write_buf = crate::lzma_compress(&batch_buffer);
-            &write_buf[..]
-        } else {
-            &batch_buffer[..]
-        };
-        let builder = batches_grp.new_dataset::<u8>();
-        let mut builder = builder.shape(data.len());
-        if shuffle {
-            builder = builder.shuffle();
-        }
-        if let Some("gzip") = compression {
-            builder = builder.deflate(compression_opts.unwrap_or(4));
-        }
-        let batch_name = batch.id.to_string();
-        let ds = builder.create(batch_name.as_str()).unwrap();
-        ds.write_raw(data).unwrap();
-        if is_lzma {
-            ds.new_attr::<u8>().shape(()).create("har_lzma").unwrap()
-                .write_scalar(&1u8).unwrap();
-        }
-        drop(batch_buffer);
     }
 
     // 5. Write index, manifests, empty_dirs, user_metadata
@@ -545,14 +674,11 @@ pub fn pack_bagit(
     crate::metadata::write_user_metadata_dataset(&h5f, &user_metadata_map);
 
     h5f.close().ok();
-    progress.finish();
-    let elapsed = t0.elapsed().as_secs_f64();
-    println!("\nOperation completed in {:.2} seconds.", elapsed);
-    println!("  {} files in {} batches, {} payload, archive: {}",
-             file_count, batches.len(), human_size(total_bytes),
-             human_size(fs::metadata(&output_h5).map(|m| m.len() as usize).unwrap_or(0)));
+    progress.flush_current_file();
 
+    // --- Phase 3: Validation (separate pass) ---
     if validate {
+        progress.enable_validation(total_size);
         let h5v = hdf5::File::open(&output_h5)
             .unwrap_or_else(|e| panic!("Failed to reopen '{}' for validation: {}", output_h5, e));
         let idx = h5v.group("index_data").expect("Missing index_data group");
@@ -568,23 +694,61 @@ pub fn pack_bagit(
         let v_shas: Vec<&str> = v_shas_str.split('\n').collect();
 
         let mut val_errors: Vec<String> = Vec::new();
-        // Cache batch data to avoid re-reading
-        let mut batch_cache: std::collections::BTreeMap<u32, Vec<u8>> = std::collections::BTreeMap::new();
+        // Cache for LZMA batches only (must decompress entire batch)
+        let mut lzma_cache: std::collections::BTreeMap<u32, Vec<u8>> = std::collections::BTreeMap::new();
         for i in 0..count_v {
             let bid = v_batch_ids[i];
-            let batch_data = batch_cache.entry(bid).or_insert_with(|| {
-                let ds = h5v.dataset(&format!("batches/{}", bid)).unwrap();
-                crate::read_dataset_content(&ds)
-            });
+            let display_name = v_paths[i].strip_prefix("data/").unwrap_or(v_paths[i]);
+            progress.begin_validation(display_name);
+
             let off = v_offsets[i] as usize;
             let len = v_lengths[i] as usize;
-            let file_bytes = &batch_data[off..off + len];
-            let actual = crate::compute_checksum(file_bytes, hash_algo);
-            if actual != v_shas[i] {
-                val_errors.push(v_paths[i].to_string());
+            let ds = h5v.dataset(&format!("batches/{}", bid)).unwrap();
+
+            let is_batch_lzma = ds.attr("har_lzma").ok()
+                .and_then(|a| a.read_scalar::<u8>().ok())
+                .map(|v| v != 0)
+                .unwrap_or(false);
+
+            if is_batch_lzma {
+                // LZMA: must read+decompress entire batch, then validate
+                let batch_data = lzma_cache.entry(bid).or_insert_with(|| {
+                    crate::read_dataset_content(&ds)
+                });
+                let file_bytes = &batch_data[off..off + len];
+                let actual = crate::compute_checksum(file_bytes, hash_algo);
+                if actual != v_shas[i] {
+                    val_errors.push(v_paths[i].to_string());
+                }
+                progress.finish_validation_file(len as u64);
+            } else {
+                // Incremental: read + hash in 1MiB chunks via hyperslab
+                let mut hasher = crate::StreamHasher::new(hash_algo);
+                let mut remaining = len;
+                let mut pos = off;
+                while remaining > 0 {
+                    let chunk_len = remaining.min(crate::READ_CHUNK);
+                    let chunk: ndarray::Array1<u8> = ds.read_slice(pos..pos + chunk_len)
+                        .expect("Failed to read validation chunk");
+                    hasher.update(chunk.as_slice().unwrap());
+                    pos += chunk_len;
+                    remaining -= chunk_len;
+                    progress.finish_validation_file(chunk_len as u64);
+                }
+                let actual = hasher.finalize_hex();
+                if actual != v_shas[i] {
+                    val_errors.push(v_paths[i].to_string());
+                }
             }
         }
         h5v.close().ok();
+
+        progress.finish();
+        let elapsed = t0.elapsed().as_secs_f64();
+        println!("\nOperation completed in {:.2} seconds.", elapsed);
+        println!("  {} files in {} batches, {} payload, archive: {}",
+                 file_count, batches.len(), human_size(total_bytes),
+                 human_size(fs::metadata(&output_h5).map(|m| m.len() as usize).unwrap_or(0)));
 
         if !val_errors.is_empty() {
             eprintln!("VALIDATION FAILED on {} file(s):", val_errors.len());
@@ -598,6 +762,13 @@ pub fn pack_bagit(
         } else {
             println!("Validation passed. {} files verified.", file_count);
         }
+    } else {
+        progress.finish();
+        let elapsed = t0.elapsed().as_secs_f64();
+        println!("\nOperation completed in {:.2} seconds.", elapsed);
+        println!("  {} files in {} batches, {} payload, archive: {}",
+                 file_count, batches.len(), human_size(total_bytes),
+                 human_size(fs::metadata(&output_h5).map(|m| m.len() as usize).unwrap_or(0)));
     }
 }
 

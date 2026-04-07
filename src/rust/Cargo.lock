@@ -529,6 +529,7 @@ dependencies = [
  "hdf5-metno",
  "lzma-rs",
  "md-5",
+ "ndarray",
  "pathdiff",
  "ratatui",
  "rayon",

@@ -1,11 +1,15 @@
+use ndarray::ArrayView1;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 // ---------------------------------------------------------------------------
@@ -24,50 +28,193 @@ fn human_size_bytes(nbytes: u64) -> String {
     format!("{:.1} PB", size)
 }
 
-pub struct Progress {
-    pub is_tty: bool,
-    completed: Vec<(String, u64)>,
-    label: Option<String>,
-    total: u64,
-    current: u64,
-    recent: Vec<String>,
-    prev_lines: usize,
+fn term_width() -> usize {
+    crossterm::terminal::size()
+        .map(|(w, _)| (w as usize).max(80))
+        .unwrap_or(80)
 }
 
-impl Progress {
+fn truncate_name(name: &str, max_len: usize) -> String {
+    if max_len < 4 {
+        return name.chars().take(max_len).collect();
+    }
+    if name.len() <= max_len {
+        name.to_string()
+    } else {
+        format!("...{}", &name[name.len() - (max_len - 3)..])
+    }
+}
+
+/// Shared counters updated by the discovery thread, read by the render loop.
+pub struct DiscoveryCounters {
+    pub files_found: AtomicU64,
+    pub bytes_found: AtomicU64,
+    pub done: AtomicBool,
+}
+
+/// Multi-phase progress display with discovery/archiving/validating bars.
+pub struct PipelineProgress {
+    pub(crate) is_tty: bool,
+    // Discovery
+    pub(crate) discovery: Arc<DiscoveryCounters>,
+    pub(crate) discovery_finished: bool,
+    // Archiving
+    pub(crate) archive_total: u64,
+    archive_current: u64,
+    archive_label: String,
+    // Current file (chunked read progress)
+    current_file_name: Option<String>,
+    current_file_size: u64,
+    current_file_read: u64,
+    current_file_writing: bool,
+    // File status window (name, size)
+    recent_completed: VecDeque<(String, u64)>,
+    queued_files: VecDeque<(String, u64)>,
+    // Validation
+    validate_enabled: bool,
+    validate_total: u64,
+    validate_current: u64,
+    validate_recent: VecDeque<String>,
+    validate_current_name: Option<String>,
+    // Rendering
+    prev_lines: usize,
+    last_render: Instant,
+    start_time: Instant,
+}
+
+const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
+
+impl PipelineProgress {
     pub fn new(verbose: bool) -> Self {
-        Progress {
+        let now = Instant::now();
+        PipelineProgress {
             is_tty: io::stderr().is_terminal() && verbose,
-            completed: Vec::new(),
-            label: None,
-            total: 0,
-            current: 0,
-            recent: Vec::new(),
+            discovery: Arc::new(DiscoveryCounters {
+                files_found: AtomicU64::new(0),
+                bytes_found: AtomicU64::new(0),
+                done: AtomicBool::new(false),
+            }),
+            discovery_finished: false,
+            archive_total: 0,
+            archive_current: 0,
+            archive_label: "Archiving".to_string(),
+            current_file_name: None,
+            current_file_size: 0,
+            current_file_read: 0,
+            current_file_writing: false,
+            recent_completed: VecDeque::new(),
+            queued_files: VecDeque::new(),
+            validate_enabled: false,
+            validate_total: 0,
+            validate_current: 0,
+            validate_recent: VecDeque::new(),
+            validate_current_name: None,
             prev_lines: 0,
+            last_render: now,
+            start_time: now,
         }
     }
 
-    pub fn start_phase(&mut self, label: &str, total_bytes: u64) {
-        if let Some(prev_label) = self.label.take() {
-            self.completed.push((prev_label, self.total));
+    pub fn discovery_counters(&self) -> Arc<DiscoveryCounters> {
+        Arc::clone(&self.discovery)
+    }
+
+    pub fn begin_file(&mut self, rel_path: &str, file_size: u64) {
+        if let Some(prev) = self.current_file_name.take() {
+            self.recent_completed.push_back((prev, self.current_file_size));
+            if self.recent_completed.len() > 2 {
+                self.recent_completed.pop_front();
+            }
         }
-        self.label = Some(label.to_string());
-        self.total = total_bytes;
-        self.current = 0;
-        self.recent.clear();
+        self.current_file_name = Some(rel_path.to_string());
+        self.current_file_size = file_size;
+        self.current_file_read = 0;
+        self.current_file_writing = false;
         if self.is_tty {
             self.render();
         }
     }
 
-    pub fn inc(&mut self, filename: &str, nbytes: u64) {
-        self.current += nbytes;
-        self.recent.push(filename.to_string());
-        if self.recent.len() > 5 {
-            self.recent.remove(0);
-        }
+    pub fn update_file_progress(&mut self, bytes_read: u64) {
+        self.current_file_read = bytes_read;
+        self.maybe_render();
+    }
+
+    pub fn mark_file_writing(&mut self) {
+        self.current_file_writing = true;
         if self.is_tty {
             self.render();
+        }
+    }
+
+    pub fn finish_file(&mut self, nbytes: u64) {
+        self.archive_current += nbytes;
+        // current_file_name stays until next begin_file moves it to completed
+        if self.is_tty {
+            self.render();
+        }
+    }
+
+    pub fn set_queued(&mut self, files: &[(String, u64)]) {
+        self.queued_files.clear();
+        for f in files.iter().take(3) {
+            self.queued_files.push_back(f.clone());
+        }
+    }
+
+    /// Move the current in-progress file to the completed list and clear queued.
+    pub fn flush_current_file(&mut self) {
+        if let Some(name) = self.current_file_name.take() {
+            self.recent_completed.push_back((name, self.current_file_size));
+            if self.recent_completed.len() > 2 {
+                self.recent_completed.pop_front();
+            }
+        }
+        self.queued_files.clear();
+        self.current_file_size = 0;
+        self.current_file_read = 0;
+        self.current_file_writing = false;
+        if self.is_tty {
+            self.render();
+        }
+    }
+
+    pub fn finish_discovery(&mut self) {
+        self.discovery_finished = true;
+        if self.is_tty {
+            self.render();
+        }
+    }
+
+    pub fn enable_validation(&mut self, total: u64) {
+        self.validate_enabled = true;
+        self.validate_total = total;
+    }
+
+    pub fn begin_validation(&mut self, name: &str) {
+        if let Some(prev) = self.validate_current_name.take() {
+            self.validate_recent.push_back(prev);
+            if self.validate_recent.len() > 2 {
+                self.validate_recent.pop_front();
+            }
+        }
+        self.validate_current_name = Some(name.to_string());
+        self.maybe_render();
+    }
+
+    pub fn finish_validation_file(&mut self, nbytes: u64) {
+        self.validate_current += nbytes;
+        self.maybe_render();
+    }
+
+    fn maybe_render(&mut self) {
+        if !self.is_tty {
+            return;
+        }
+        let now = Instant::now();
+        if now.duration_since(self.last_render) >= Duration::from_millis(50) {
+            self.render();
+            self.last_render = now;
         }
     }
 
@@ -77,35 +224,126 @@ impl Progress {
             write!(err, "\x1b[{}A", self.prev_lines).ok();
         }
 
-        let bar_width: usize = 40;
+        let tw = term_width();
+        let bar_width: usize = if tw >= 100 { 40 } else if tw >= 60 { tw - 60 + 20 } else { 20 };
+        let name_max = tw.saturating_sub(10);
         let mut lines: usize = 0;
 
-        for (label, total) in &self.completed {
+        // Auto-detect discovery completion from the atomic flag
+        if !self.discovery_finished && self.discovery.done.load(Ordering::Acquire) {
+            self.discovery_finished = true;
+        }
+
+        // --- Discovery bar ---
+        if self.discovery_finished {
+            let total = self.discovery.bytes_found.load(Ordering::Relaxed);
+            let count = self.discovery.files_found.load(Ordering::Relaxed);
             let bar = "\u{2588}".repeat(bar_width);
-            let tot_h = human_size_bytes(*total);
-            writeln!(err, "\x1b[2K\u{2713} {:12} [{}] 100.0% ({} / {})",
-                     label, bar, tot_h, tot_h).ok();
+            writeln!(err, "\x1b[2K\x1b[32m\u{2713}\x1b[0m {:12} [\x1b[32m{}\x1b[0m] 100.0% ({} files / {})",
+                     "Discovering", bar, count, human_size_bytes(total)).ok();
+        } else {
+            let count = self.discovery.files_found.load(Ordering::Relaxed);
+            let bytes = self.discovery.bytes_found.load(Ordering::Relaxed);
+            let frame = (self.start_time.elapsed().as_millis() / 100) as usize % 4;
+            writeln!(err, "\x1b[2K{} {:12} ... ({} files / {} found)",
+                     SPINNER[frame], "Discovering", count, human_size_bytes(bytes)).ok();
+        }
+        lines += 1;
+
+        // --- Archiving bar ---
+        let total = self.archive_total;
+        if total > 0 {
+            let effective = (self.archive_current + self.current_file_read).min(total);
+            let pct = (effective as f64 * 100.0 / total as f64).min(100.0);
+            let filled = ((bar_width as u64).saturating_mul(effective) / total) as usize;
+            let filled = filled.min(bar_width);
+            let empty = bar_width - filled;
+            writeln!(err, "\x1b[2K  {:12} [{}{}] {:.1}% ({} / {})",
+                     self.archive_label,
+                     "\u{2588}".repeat(filled),
+                     "\u{2591}".repeat(empty),
+                     pct,
+                     human_size_bytes(effective),
+                     human_size_bytes(total)).ok();
+        } else {
+            writeln!(err, "\x1b[2K  {:12} [{}] waiting...",
+                     self.archive_label, "\u{2591}".repeat(bar_width)).ok();
+        }
+        lines += 1;
+
+        // --- File status window ---
+        // Completed files (green) with size
+        for (name, size) in &self.recent_completed {
+            let size_str = human_size_bytes(*size);
+            let suffix = format!("  ({})", size_str);
+            writeln!(err, "\x1b[2K    \x1b[32m\u{2713} {}{}\x1b[0m",
+                     truncate_name(name, name_max.saturating_sub(suffix.len())), suffix).ok();
+            lines += 1;
+        }
+        // Current file (magenta with progress + size)
+        if let Some(ref name) = self.current_file_name {
+            let size_str = human_size_bytes(self.current_file_size);
+            if self.current_file_writing {
+                let suffix = format!("  writing... ({})", size_str);
+                writeln!(err, "\x1b[2K    \x1b[35m\u{25b8} {}{}\x1b[0m",
+                         truncate_name(name, name_max.saturating_sub(suffix.len())), suffix).ok();
+            } else if self.current_file_size > 0 && self.current_file_read < self.current_file_size {
+                let pct = self.current_file_read as f64 * 100.0 / self.current_file_size as f64;
+                let suffix = format!("  {:.1}% ({})", pct, size_str);
+                writeln!(err, "\x1b[2K    \x1b[35m\u{25b8} {}{}\x1b[0m",
+                         truncate_name(name, name_max.saturating_sub(suffix.len())), suffix).ok();
+            } else {
+                let suffix = format!("  ({})", size_str);
+                writeln!(err, "\x1b[2K    \x1b[35m\u{25b8} {}{}\x1b[0m",
+                         truncate_name(name, name_max.saturating_sub(suffix.len())), suffix).ok();
+            }
+            lines += 1;
+        }
+        // Queued files (dim gray) with size
+        for (name, size) in &self.queued_files {
+            let size_str = human_size_bytes(*size);
+            let suffix = format!("  ({})", size_str);
+            writeln!(err, "\x1b[2K    \x1b[90m\u{25cb} {}{}\x1b[0m",
+                     truncate_name(name, name_max.saturating_sub(suffix.len())), suffix).ok();
             lines += 1;
         }
 
-        if let Some(ref label) = self.label {
-            if self.total > 0 {
-                let pct = self.current as f64 * 100.0 / self.total as f64;
-                let filled = (bar_width as u64 * self.current / self.total) as usize;
-                let empty = bar_width - filled;
-                writeln!(err, "\x1b[2K  {:12} [{}{}] {:.1}% ({} / {})",
-                         label,
-                         "\u{2588}".repeat(filled),
-                         "\u{2591}".repeat(empty),
-                         pct,
-                         human_size_bytes(self.current),
-                         human_size_bytes(self.total)).ok();
+        // --- Validation bar (only if enabled) ---
+        if self.validate_enabled && self.validate_total > 0 {
+            let pct = (self.validate_current as f64 * 100.0 / self.validate_total as f64).min(100.0);
+            let filled = ((bar_width as u64).saturating_mul(self.validate_current) / self.validate_total) as usize;
+            let filled = filled.min(bar_width);
+            let empty = bar_width - filled;
+            writeln!(err, "\x1b[2K  {:12} [{}{}] {:.1}% ({} / {})",
+                     "Validating",
+                     "\u{2588}".repeat(filled),
+                     "\u{2591}".repeat(empty),
+                     pct,
+                     human_size_bytes(self.validate_current),
+                     human_size_bytes(self.validate_total)).ok();
+            lines += 1;
+
+            // Validation file status
+            for name in &self.validate_recent {
+                writeln!(err, "\x1b[2K    \x1b[32m\u{2713} {}\x1b[0m",
+                         truncate_name(name, name_max)).ok();
                 lines += 1;
-                for f in &self.recent {
-                    writeln!(err, "\x1b[2K    \u{2713} {}", f).ok();
-                    lines += 1;
-                }
             }
+            if let Some(ref name) = self.validate_current_name {
+                writeln!(err, "\x1b[2K    \x1b[35m\u{25b8} {}\x1b[0m",
+                         truncate_name(name, name_max)).ok();
+                lines += 1;
+            }
+        }
+
+        // Clear leftover lines from previous render
+        let prev = self.prev_lines;
+        for _ in 0..prev.saturating_sub(lines) {
+            writeln!(err, "\x1b[2K").ok();
+        }
+        let extra = prev.saturating_sub(lines);
+        if extra > 0 {
+            write!(err, "\x1b[{}A", extra).ok();
         }
 
         self.prev_lines = lines;
@@ -113,24 +351,47 @@ impl Progress {
     }
 
     pub fn finish(&mut self) {
-        if let Some(prev_label) = self.label.take() {
-            self.completed.push((prev_label, self.total));
+        // Move current file to completed
+        if let Some(name) = self.current_file_name.take() {
+            self.recent_completed.push_back((name, self.current_file_size));
+        }
+        if let Some(name) = self.validate_current_name.take() {
+            self.validate_recent.push_back(name);
         }
         if !self.is_tty || self.prev_lines == 0 {
             return;
         }
         let mut err = io::stderr().lock();
         write!(err, "\x1b[{}A", self.prev_lines).ok();
-        let bar_width: usize = 40;
+
+        let tw = term_width();
+        let bar_width: usize = if tw >= 100 { 40 } else if tw >= 60 { tw - 60 + 20 } else { 20 };
         let bar = "\u{2588}".repeat(bar_width);
         let mut lines: usize = 0;
-        for (label, total) in &self.completed {
-            let tot_h = human_size_bytes(*total);
-            writeln!(err, "\x1b[2K\u{2713} {:12} [{}] 100.0% ({} / {})",
-                     label, bar, tot_h, tot_h).ok();
+
+        // Discovery complete
+        let dtotal = self.discovery.bytes_found.load(Ordering::Relaxed);
+        let dcount = self.discovery.files_found.load(Ordering::Relaxed);
+        writeln!(err, "\x1b[2K\x1b[32m\u{2713}\x1b[0m {:12} [\x1b[32m{}\x1b[0m] 100.0% ({} files / {})",
+                 "Discovering", bar, dcount, human_size_bytes(dtotal)).ok();
+        lines += 1;
+
+        // Archiving complete
+        let atotal_h = human_size_bytes(self.archive_total);
+        writeln!(err, "\x1b[2K\x1b[32m\u{2713}\x1b[0m {:12} [\x1b[32m{}\x1b[0m] 100.0% ({} / {})",
+                 self.archive_label, bar, atotal_h, atotal_h).ok();
+        lines += 1;
+
+        // Validation complete
+        if self.validate_enabled && self.validate_total > 0 {
+            let vtotal_h = human_size_bytes(self.validate_total);
+            writeln!(err, "\x1b[2K\x1b[32m\u{2713}\x1b[0m {:12} [\x1b[32m{}\x1b[0m] 100.0% ({} / {})",
+                     "Validating", bar, vtotal_h, vtotal_h).ok();
             lines += 1;
         }
-        for _ in 0..(self.prev_lines.saturating_sub(lines)) {
+
+        // Clear leftover lines
+        for _ in 0..self.prev_lines.saturating_sub(lines) {
             writeln!(err, "\x1b[2K").ok();
         }
         let extra = self.prev_lines.saturating_sub(lines);
@@ -139,6 +400,71 @@ impl Progress {
         }
         err.flush().ok();
         self.prev_lines = 0;
+    }
+}
+
+/// Backward-compatible wrapper around PipelineProgress for use by bagit.rs,
+/// extraction, and the parallel pack path.
+pub struct Progress {
+    pub is_tty: bool,
+    inner: PipelineProgress,
+    completed_phases: Vec<(String, u64)>,
+    label: Option<String>,
+}
+
+impl Progress {
+    pub fn new(verbose: bool) -> Self {
+        let mut inner = PipelineProgress::new(verbose);
+        // Mark discovery as already finished (simple mode)
+        inner.discovery_finished = true;
+        inner.discovery.done.store(true, Ordering::Relaxed);
+        let is_tty = inner.is_tty;
+        Progress {
+            is_tty,
+            inner,
+            completed_phases: Vec::new(),
+            label: None,
+        }
+    }
+
+    pub fn start_phase(&mut self, label: &str, total_bytes: u64) {
+        if let Some(prev_label) = self.label.take() {
+            self.completed_phases.push((prev_label, self.inner.archive_total));
+        }
+        self.label = Some(label.to_string());
+        self.inner.archive_label = label.to_string();
+        self.inner.archive_total = total_bytes;
+        self.inner.archive_current = 0;
+        self.inner.recent_completed.clear();
+        self.inner.current_file_name = None;
+        self.inner.queued_files.clear();
+        self.inner.discovery.bytes_found.store(total_bytes, Ordering::Relaxed);
+        if self.is_tty {
+            self.inner.render();
+        }
+    }
+
+    pub fn inc(&mut self, filename: &str, nbytes: u64) {
+        self.inner.archive_current += nbytes;
+        // Move current to completed, set this as current briefly then move it
+        if let Some(prev) = self.inner.current_file_name.take() {
+            self.inner.recent_completed.push_back((prev, self.inner.current_file_size));
+            if self.inner.recent_completed.len() > 5 {
+                self.inner.recent_completed.pop_front();
+            }
+        }
+        self.inner.current_file_name = Some(filename.to_string());
+        self.inner.current_file_size = nbytes;
+        if self.is_tty {
+            self.inner.render();
+        }
+    }
+
+    pub fn finish(&mut self) {
+        if let Some(prev_label) = self.label.take() {
+            self.completed_phases.push((prev_label, self.inner.archive_total));
+        }
+        self.inner.finish();
     }
 }
 
@@ -233,6 +559,45 @@ fn read_file(path: &Path) -> io::Result<FileData> {
     let group = users::get_group_by_gid(gid)
         .map(|g| g.name().to_string_lossy().to_string())
         .unwrap_or_else(|| gid.to_string());
+    Ok(FileData { content, mode, uid, gid, owner, group, mtime })
+}
+
+pub(crate) const READ_CHUNK: usize = 1 << 20; // 1 MiB
+
+/// Read a file in chunks, calling `on_progress(total_bytes_read_so_far)` after each chunk.
+fn read_file_chunked<F>(path: &Path, mut on_progress: F) -> io::Result<FileData>
+where
+    F: FnMut(u64),
+{
+    let meta = fs::metadata(path)?;
+    let file_size = meta.len() as usize;
+    let mode = meta.permissions().mode();
+    use std::os::unix::fs::MetadataExt;
+    let uid = meta.uid();
+    let gid = meta.gid();
+    let mtime = meta.modified()?.duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_secs_f64();
+    let owner = users::get_user_by_uid(uid)
+        .map(|u| u.name().to_string_lossy().to_string())
+        .unwrap_or_else(|| uid.to_string());
+    let group = users::get_group_by_gid(gid)
+        .map(|g| g.name().to_string_lossy().to_string())
+        .unwrap_or_else(|| gid.to_string());
+
+    let mut content = Vec::with_capacity(file_size);
+    let mut file = fs::File::open(path)?;
+    let mut buf = vec![0u8; READ_CHUNK];
+    let mut total_read: u64 = 0;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        content.extend_from_slice(&buf[..n]);
+        total_read += n as u64;
+        on_progress(total_read);
+    }
+
     Ok(FileData { content, mode, uid, gid, owner, group, mtime })
 }
 
@@ -360,6 +725,137 @@ fn create_dataset(
     ds
 }
 
+/// Create a pre-allocated dataset for chunked writing (no data written yet).
+/// Returns the dataset handle. Caller writes data via `write_slice`.
+/// Falls back to None for LZMA (needs full buffer for application-level compression).
+fn create_dataset_shell(
+    h5f: &hdf5::File,
+    rel_path: &str,
+    file_size: usize,
+    compression: Option<&str>,
+    compression_opts: Option<u8>,
+    shuffle: bool,
+) -> Option<hdf5::Dataset> {
+    if compression == Some("lzma") {
+        return None; // LZMA needs full buffer
+    }
+
+    let chunk_size = READ_CHUNK.min(file_size.max(1)); // at least 1 byte chunk
+    let mut builder = h5f.new_dataset::<u8>().shape(file_size).chunk(chunk_size);
+
+    if shuffle {
+        builder = builder.shuffle();
+    }
+
+    match compression {
+        Some("gzip") => {
+            builder = builder.deflate(compression_opts.unwrap_or(4));
+        }
+        Some("lzf") => {
+            builder = builder.deflate(1);
+        }
+        _ => {}
+    }
+
+    Some(
+        builder
+            .create(rel_path)
+            .unwrap_or_else(|e| panic!("Failed to create dataset '{}': {}", rel_path, e)),
+    )
+}
+
+/// Write a chunk to a pre-allocated dataset via hyperslab selection.
+pub(crate) fn write_dataset_chunk(ds: &hdf5::Dataset, chunk: &[u8], offset: usize) {
+    let view = ArrayView1::from(chunk);
+    ds.write_slice(&view, offset..offset + chunk.len())
+        .unwrap_or_else(|e| panic!("Failed to write chunk at offset {}: {}", offset, e));
+}
+
+/// Streaming hasher that supports all checksum algorithms.
+pub(crate) enum StreamHasher {
+    Md5(md5::Md5),
+    Sha256(Sha256),
+    Blake3(Box<blake3::Hasher>),
+}
+
+impl StreamHasher {
+    pub(crate) fn new(algo: &str) -> Self {
+        match algo {
+            "md5" => StreamHasher::Md5(<md5::Md5 as Digest>::new()),
+            "sha256" => StreamHasher::Sha256(Sha256::new()),
+            "blake3" => StreamHasher::Blake3(Box::new(blake3::Hasher::new())),
+            _ => panic!("Unsupported checksum algorithm: {}", algo),
+        }
+    }
+    pub(crate) fn update(&mut self, data: &[u8]) {
+        match self {
+            StreamHasher::Md5(h) => { h.update(data); }
+            StreamHasher::Sha256(h) => { h.update(data); }
+            StreamHasher::Blake3(h) => { h.update(data); }
+        }
+    }
+    pub(crate) fn finalize_hex(self) -> String {
+        match self {
+            StreamHasher::Md5(h) => format!("{:x}", h.finalize()),
+            StreamHasher::Sha256(h) => format!("{:x}", h.finalize()),
+            StreamHasher::Blake3(h) => h.finalize().to_hex().to_string(),
+        }
+    }
+}
+
+/// Finalize a chunked dataset: write checksum attributes.
+fn finalize_dataset_checksum(
+    ds: &hdf5::Dataset,
+    algo: Option<&str>,
+    hasher: Option<StreamHasher>,
+) {
+    if let (Some(algo), Some(h)) = (algo, hasher) {
+        let hash = h.finalize_hex();
+        ds.new_attr::<hdf5::types::VarLenUnicode>()
+            .shape(())
+            .create("har_checksum")
+            .unwrap()
+            .write_scalar(&hash.parse::<hdf5::types::VarLenUnicode>().unwrap())
+            .unwrap();
+        ds.new_attr::<hdf5::types::VarLenUnicode>()
+            .shape(())
+            .create("har_checksum_algo")
+            .unwrap()
+            .write_scalar(&algo.parse::<hdf5::types::VarLenUnicode>().unwrap())
+            .unwrap();
+    }
+}
+
+/// Read file metadata without content.
+pub(crate) struct FileMeta {
+    pub(crate) mode: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) owner: String,
+    pub(crate) group: String,
+    pub(crate) mtime: f64,
+}
+
+pub(crate) fn read_file_meta(path: &Path) -> io::Result<FileMeta> {
+    let meta = fs::metadata(path)?;
+    let mode = meta.permissions().mode();
+    use std::os::unix::fs::MetadataExt;
+    let uid = meta.uid();
+    let gid = meta.gid();
+    let mtime = meta
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let owner = users::get_user_by_uid(uid)
+        .map(|u| u.name().to_string_lossy().to_string())
+        .unwrap_or_else(|| uid.to_string());
+    let group = users::get_group_by_gid(gid)
+        .map(|g| g.name().to_string_lossy().to_string())
+        .unwrap_or_else(|| gid.to_string());
+    Ok(FileMeta { mode, uid, gid, owner, group, mtime })
+}
+
 /// Archive or append the given sources into an HDF5 archive.
 ///
 /// `file_mode` should be `"w"` to create a new archive (truncate) or `"a"` to append.
@@ -379,68 +875,6 @@ pub fn pack_or_append_to_h5(
 ) {
     let output_h5 = shellexpand::tilde(output_h5).to_string();
     let t0 = Instant::now();
-
-    // Phase 1: Collect file inventory and empty directories.
-    let mut file_entries: Vec<FileEntry> = Vec::new();
-    let mut empty_dirs: Vec<String> = Vec::new();
-
-    for source in sources {
-        let source = shellexpand::tilde(source).to_string();
-        let source_path = Path::new(&source);
-
-        if source_path.is_dir() {
-            let source_norm = source_path
-                .canonicalize()
-                .unwrap_or_else(|_| source_path.to_path_buf());
-            let base_dir = source_norm
-                .parent()
-                .unwrap_or_else(|| Path::new(""))
-                .to_path_buf();
-
-            for entry in WalkDir::new(&source_norm)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                let entry_path = entry.path().to_path_buf();
-                if entry_path.is_file() {
-                    let rel = pathdiff::diff_paths(&entry_path, &base_dir)
-                        .unwrap_or_else(|| entry_path.clone());
-                    file_entries.push(FileEntry {
-                        file_path: entry_path,
-                        rel_path: rel.to_string_lossy().to_string(),
-                    });
-                } else if entry_path.is_dir() && entry_path != source_norm {
-                    // Check if truly empty (no children at all)
-                    let is_empty = WalkDir::new(&entry_path)
-                        .min_depth(1)
-                        .into_iter()
-                        .filter_map(|e| e.ok())
-                        .next()
-                        .is_none();
-                    if is_empty {
-                        let rel = pathdiff::diff_paths(&entry_path, &base_dir)
-                            .unwrap_or_else(|| entry_path.clone());
-                        empty_dirs.push(rel.to_string_lossy().to_string());
-                    }
-                }
-            }
-        } else if source_path.is_file() {
-            file_entries.push(FileEntry {
-                file_path: source_path.to_path_buf(),
-                rel_path: source_path
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string(),
-            });
-        } else {
-            eprintln!(
-                "Warning: '{}' is not a valid file or directory; skipping.",
-                source
-            );
-        }
-    }
-
     let is_append = file_mode == "a";
 
     // Open or create the HDF5 file
@@ -454,10 +888,7 @@ pub fn pack_or_append_to_h5(
             .unwrap_or_else(|e| panic!("Failed to create '{}': {}", output_h5, e))
     };
 
-    let total_size: u64 = file_entries.iter().map(|e| {
-        fs::metadata(&e.file_path).map(|m| m.len()).unwrap_or(0)
-    }).sum();
-    let mut progress = Progress::new(verbose);
+    let mut progress = PipelineProgress::new(verbose);
     let verbose_file = verbose && !progress.is_tty;
     let mut validation_errors: Vec<String> = Vec::new();
     let mut validated_count: usize = 0;
@@ -506,27 +937,385 @@ pub fn pack_or_append_to_h5(
         };
 
     if parallel <= 1 {
-        // Sequential path
-        progress.start_phase("Archiving", total_size);
-        for entry in &file_entries {
-            let fd = read_file(&entry.file_path).expect("Failed to read file");
-            write_to_h5(&h5f, &entry.rel_path, &fd.content, fd.mode, fd.uid, fd.gid, &fd.owner, &fd.group, fd.mtime, true, Some(&entry.file_path));
-            if validate {
-                if let Some(algo) = checksum {
-                    let readback = read_dataset_content(&h5f.dataset(&entry.rel_path).unwrap());
-                    let actual = compute_checksum(&readback, algo);
-                    let expected = compute_checksum(&fd.content, algo);
-                    if actual != expected {
-                        validation_errors.push(entry.rel_path.clone());
+        // ---- Sequential pipelined path ----
+        // Spawn discovery thread to walk directories asynchronously.
+        let discovery = progress.discovery_counters();
+        let sources_owned: Vec<String> = sources.iter().map(|s| s.to_string()).collect();
+
+        let (tx, rx) = mpsc::sync_channel::<(FileEntry, u64)>(64);
+        let discovery_handle = std::thread::spawn(move || {
+            let mut empty_dirs_local: Vec<String> = Vec::new();
+            for source in &sources_owned {
+                let source = shellexpand::tilde(source).to_string();
+                let source_path = Path::new(&source).to_path_buf();
+
+                if source_path.is_dir() {
+                    let source_norm = source_path
+                        .canonicalize()
+                        .unwrap_or_else(|_| source_path.clone());
+                    let base_dir = source_norm
+                        .parent()
+                        .unwrap_or_else(|| Path::new(""))
+                        .to_path_buf();
+
+                    for entry in WalkDir::new(&source_norm)
+                        .into_iter()
+                        .filter_map(|e| e.ok())
+                    {
+                        let entry_path = entry.path().to_path_buf();
+                        if entry_path.is_file() {
+                            let size = fs::metadata(&entry_path).map(|m| m.len()).unwrap_or(0);
+                            let rel = pathdiff::diff_paths(&entry_path, &base_dir)
+                                .unwrap_or_else(|| entry_path.clone());
+                            discovery.files_found.fetch_add(1, Ordering::Relaxed);
+                            discovery.bytes_found.fetch_add(size, Ordering::Relaxed);
+                            let fe = FileEntry {
+                                file_path: entry_path,
+                                rel_path: rel.to_string_lossy().to_string(),
+                            };
+                            if tx.send((fe, size)).is_err() {
+                                return empty_dirs_local;
+                            }
+                        } else if entry_path.is_dir() && entry_path != source_norm {
+                            let is_empty = WalkDir::new(&entry_path)
+                                .min_depth(1)
+                                .into_iter()
+                                .filter_map(|e| e.ok())
+                                .next()
+                                .is_none();
+                            if is_empty {
+                                let rel = pathdiff::diff_paths(&entry_path, &base_dir)
+                                    .unwrap_or_else(|| entry_path.clone());
+                                empty_dirs_local.push(rel.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                } else if source_path.is_file() {
+                    let size = fs::metadata(&source_path).map(|m| m.len()).unwrap_or(0);
+                    discovery.files_found.fetch_add(1, Ordering::Relaxed);
+                    discovery.bytes_found.fetch_add(size, Ordering::Relaxed);
+                    let fe = FileEntry {
+                        file_path: source_path.clone(),
+                        rel_path: source_path
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .to_string(),
+                    };
+                    if tx.send((fe, size)).is_err() {
+                        return empty_dirs_local;
+                    }
+                } else {
+                    eprintln!(
+                        "Warning: '{}' is not a valid file or directory; skipping.",
+                        source
+                    );
+                }
+            }
+            discovery.done.store(true, Ordering::Release);
+            empty_dirs_local
+        });
+
+        // Main thread: consume from channel and archive files as they arrive.
+        let mut queued: VecDeque<(FileEntry, u64)> = VecDeque::new();
+        let discovery_ref = progress.discovery_counters();
+        let mut archived_files: Vec<(String, u64)> = Vec::new();
+
+        // Render initial state
+        if progress.is_tty {
+            progress.render();
+        }
+
+        // --- Phase 2: Archiving ---
+        loop {
+            // Drain available entries from channel into queue
+            loop {
+                match rx.try_recv() {
+                    Ok((entry, size)) => {
+                        progress.archive_total += size;
+                        queued.push_back((entry, size));
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+
+            if let Some((entry, _size)) = queued.pop_front() {
+                // Update queued display (after popping current file)
+                let queued_names: Vec<(String, u64)> = queued.iter().take(3)
+                    .map(|(e, s)| (e.rel_path.clone(), *s)).collect();
+                progress.set_queued(&queued_names);
+
+                let file_size = fs::metadata(&entry.file_path).map(|m| m.len()).unwrap_or(0);
+                progress.begin_file(&entry.rel_path, file_size);
+
+                // Ensure parent groups exist
+                if let Some(parent) = Path::new(&entry.rel_path).parent() {
+                    let gp = parent.to_string_lossy().to_string();
+                    if !gp.is_empty() {
+                        ensure_group(&h5f, &gp);
+                    }
+                }
+
+                // Skip if already exists in append mode
+                if is_append && h5f.dataset(&entry.rel_path).is_ok() {
+                    if verbose_file {
+                        println!("Skipping {} (already exists)", &entry.rel_path);
+                    }
+                    progress.finish_file(file_size);
+                    continue;
+                }
+
+                let file_meta = read_file_meta(&entry.file_path).expect("Failed to stat file");
+
+                // Try pipelined read/write (not available for LZMA)
+                if let Some(ds) = create_dataset_shell(
+                    &h5f, &entry.rel_path, file_size as usize,
+                    compression, compression_opts, shuffle,
+                ) {
+                    // Spawn reader thread — reads file in chunks, sends via channel
+                    let (chunk_tx, chunk_rx) = mpsc::sync_channel::<Vec<u8>>(4);
+                    let read_path = entry.file_path.clone();
+                    let reader = std::thread::spawn(move || {
+                        let mut file = fs::File::open(&read_path)
+                            .expect("Failed to open file for reading");
+                        let mut buf = vec![0u8; READ_CHUNK];
+                        loop {
+                            let n = file.read(&mut buf).expect("Failed to read file chunk");
+                            if n == 0 { break; }
+                            if chunk_tx.send(buf[..n].to_vec()).is_err() { break; }
+                        }
+                    });
+
+                    // Main thread: write chunks to HDF5 as they arrive
+                    let mut offset: usize = 0;
+                    let mut hasher = checksum.map(StreamHasher::new);
+                    for chunk in chunk_rx.iter() {
+                        let chunk_len = chunk.len();
+                        if let Some(ref mut h) = hasher {
+                            h.update(&chunk);
+                        }
+                        write_dataset_chunk(&ds, &chunk, offset);
+                        offset += chunk_len;
+                        progress.update_file_progress(offset as u64);
+                    }
+                    reader.join().expect("Reader thread panicked");
+
+                    // Store checksum
+                    finalize_dataset_checksum(&ds, checksum, hasher);
+
+                    // Write metadata attributes
+                    ds.new_attr::<u32>().shape(()).create("mode").unwrap().write_scalar(&file_meta.mode).unwrap();
+                    ds.new_attr::<u32>().shape(()).create("uid").unwrap().write_scalar(&file_meta.uid).unwrap();
+                    ds.new_attr::<u32>().shape(()).create("gid").unwrap().write_scalar(&file_meta.gid).unwrap();
+                    ds.new_attr::<f64>().shape(()).create("mtime").unwrap().write_scalar(&file_meta.mtime).unwrap();
+                    let owner_vu: hdf5::types::VarLenUnicode = file_meta.owner.parse().unwrap();
+                    ds.new_attr::<hdf5::types::VarLenUnicode>().shape(()).create("owner").unwrap().write_scalar(&owner_vu).unwrap();
+                    let group_vu: hdf5::types::VarLenUnicode = file_meta.group.parse().unwrap();
+                    ds.new_attr::<hdf5::types::VarLenUnicode>().shape(()).create("group").unwrap().write_scalar(&group_vu).unwrap();
+
+                    if xattr_flag {
+                        let xattrs = metadata::read_xattrs(&entry.file_path);
+                        for (name, value) in &xattrs {
+                            let attr_name = format!("xattr.{}", name);
+                            if let Ok(a) = ds.new_attr::<u8>().shape(value.len()).create(&*attr_name) {
+                                a.write_raw(value).ok();
+                            }
+                        }
+                    }
+
+                    if verbose_file {
+                        println!("Storing: {}", &entry.rel_path);
+                    }
+                } else {
+                    // LZMA fallback: read all then write
+                    let fd = read_file_chunked(&entry.file_path, |bytes_read| {
+                        progress.update_file_progress(bytes_read);
+                    }).expect("Failed to read file");
+                    progress.mark_file_writing();
+                    write_to_h5(&h5f, &entry.rel_path, &fd.content, fd.mode, fd.uid, fd.gid,
+                                &fd.owner, &fd.group, fd.mtime, true, Some(&entry.file_path));
+                }
+
+                archived_files.push((entry.rel_path.clone(), file_size));
+                progress.finish_file(file_size);
+            } else if discovery_ref.done.load(Ordering::Acquire) {
+                // Discovery done — drain any remaining items
+                let mut found_more = false;
+                for item in rx.try_iter() {
+                    progress.archive_total += item.1;
+                    queued.push_back(item);
+                    found_more = true;
+                }
+                if !found_more && queued.is_empty() {
+                    break;
+                }
+            } else {
+                // Queue empty, discovery still running — wait briefly
+                match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok((entry, size)) => {
+                        progress.archive_total += size;
+                        queued.push_back((entry, size));
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        progress.maybe_render();
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {}
+                }
+            }
+        }
+
+        progress.finish_discovery();
+        progress.flush_current_file();
+
+        // --- Phase 3: Validation (separate pass) ---
+        if validate {
+            if let Some(algo) = checksum {
+                progress.enable_validation(progress.archive_total);
+                for (rel_path, content_len) in &archived_files {
+                    progress.begin_validation(rel_path);
+                    let ds = h5f.dataset(rel_path).unwrap();
+
+                    let is_lzma_ds = ds.attr("har_lzma").ok()
+                        .and_then(|a| a.read_scalar::<u8>().ok())
+                        .map(|v| v != 0)
+                        .unwrap_or(false);
+
+                    let stored_hash = ds
+                        .attr("har_checksum")
+                        .ok()
+                        .and_then(|a| a.read_scalar::<hdf5::types::VarLenUnicode>().ok())
+                        .map(|v| v.as_str().to_string());
+
+                    if is_lzma_ds {
+                        // LZMA: must read+decompress entire dataset
+                        let readback = read_dataset_content(&ds);
+                        let actual = compute_checksum(&readback, algo);
+                        if let Some(expected) = stored_hash {
+                            if actual != expected {
+                                validation_errors.push(rel_path.clone());
+                            } else {
+                                validated_count += 1;
+                            }
+                        } else {
+                            validated_count += 1;
+                        }
+                        progress.finish_validation_file(*content_len);
                     } else {
-                        validated_count += 1;
+                        // Incremental: read + hash in 1MiB chunks via hyperslab
+                        let ds_size = *content_len as usize;
+                        let mut hasher = StreamHasher::new(algo);
+                        let mut remaining = ds_size;
+                        let mut pos: usize = 0;
+                        while remaining > 0 {
+                            let chunk_len = remaining.min(READ_CHUNK);
+                            let chunk: ndarray::Array1<u8> = ds.read_slice(pos..pos + chunk_len)
+                                .expect("Failed to read validation chunk");
+                            hasher.update(chunk.as_slice().unwrap());
+                            pos += chunk_len;
+                            remaining -= chunk_len;
+                            progress.finish_validation_file(chunk_len as u64);
+                        }
+                        let actual = hasher.finalize_hex();
+                        if let Some(expected) = stored_hash {
+                            if actual != expected {
+                                validation_errors.push(rel_path.clone());
+                            } else {
+                                validated_count += 1;
+                            }
+                        } else {
+                            validated_count += 1;
+                        }
                     }
                 }
             }
-            progress.inc(&entry.rel_path, fd.content.len() as u64);
+        }
+
+        progress.finish();
+
+        // Collect empty dirs from the discovery thread
+        let empty_dirs = discovery_handle.join().expect("Discovery thread panicked");
+
+        // Store empty directories
+        for rel_dir in &empty_dirs {
+            let grp = ensure_group(&h5f, rel_dir);
+            grp.new_attr::<u8>()
+                .shape(())
+                .create("empty_dir")
+                .expect("Failed to create empty_dir attr")
+                .write_scalar(&1u8)
+                .expect("Failed to write empty_dir attr");
+            if verbose_file {
+                println!("Storing empty dir: {}", rel_dir);
+            }
         }
     } else {
-        // Parallel path: read files in parallel, then write to HDF5 sequentially
+        // ---- Parallel path: synchronous walk, parallel read, sequential write ----
+        let mut file_entries: Vec<FileEntry> = Vec::new();
+        let mut empty_dirs: Vec<String> = Vec::new();
+
+        for source in sources {
+            let source = shellexpand::tilde(source).to_string();
+            let source_path = Path::new(&source);
+
+            if source_path.is_dir() {
+                let source_norm = source_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| source_path.to_path_buf());
+                let base_dir = source_norm
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .to_path_buf();
+
+                for entry in WalkDir::new(&source_norm)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                {
+                    let entry_path = entry.path().to_path_buf();
+                    if entry_path.is_file() {
+                        let rel = pathdiff::diff_paths(&entry_path, &base_dir)
+                            .unwrap_or_else(|| entry_path.clone());
+                        file_entries.push(FileEntry {
+                            file_path: entry_path,
+                            rel_path: rel.to_string_lossy().to_string(),
+                        });
+                    } else if entry_path.is_dir() && entry_path != source_norm {
+                        let is_empty = WalkDir::new(&entry_path)
+                            .min_depth(1)
+                            .into_iter()
+                            .filter_map(|e| e.ok())
+                            .next()
+                            .is_none();
+                        if is_empty {
+                            let rel = pathdiff::diff_paths(&entry_path, &base_dir)
+                                .unwrap_or_else(|| entry_path.clone());
+                            empty_dirs.push(rel.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            } else if source_path.is_file() {
+                file_entries.push(FileEntry {
+                    file_path: source_path.to_path_buf(),
+                    rel_path: source_path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string(),
+                });
+            } else {
+                eprintln!(
+                    "Warning: '{}' is not a valid file or directory; skipping.",
+                    source
+                );
+            }
+        }
+
+        let total_size: u64 = file_entries.iter().map(|e| {
+            fs::metadata(&e.file_path).map(|m| m.len()).unwrap_or(0)
+        }).sum();
+
+        let mut compat_progress = Progress::new(verbose);
+
         let mut all_groups = BTreeSet::new();
         for entry in &file_entries {
             if let Some(parent) = Path::new(&entry.rel_path).parent() {
@@ -540,7 +1329,7 @@ pub fn pack_or_append_to_h5(
             ensure_group(&h5f, g);
         }
 
-        progress.start_phase("Reading", total_size);
+        compat_progress.start_phase("Reading", total_size);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(parallel)
             .build()
@@ -564,14 +1353,19 @@ pub fn pack_or_append_to_h5(
                 .collect()
         });
         for r in &read_results {
-            progress.inc(&r.rel_path, r.content.len() as u64);
+            compat_progress.inc(&r.rel_path, r.content.len() as u64);
         }
 
-        progress.start_phase("Writing", total_size);
+        compat_progress.start_phase("Writing", total_size);
         for r in &read_results {
             write_to_h5(&h5f, &r.rel_path, &r.content, r.mode, r.uid, r.gid, &r.owner, &r.group, r.mtime, false, Some(&r.file_path));
-            if validate {
-                if let Some(algo) = checksum {
+            compat_progress.inc(&r.rel_path, r.content.len() as u64);
+        }
+
+        if validate {
+            if let Some(algo) = checksum {
+                compat_progress.start_phase("Validating", total_size);
+                for r in &read_results {
                     let readback = read_dataset_content(&h5f.dataset(&r.rel_path).unwrap());
                     let actual = compute_checksum(&readback, algo);
                     let expected = compute_checksum(&r.content, algo);
@@ -580,24 +1374,24 @@ pub fn pack_or_append_to_h5(
                     } else {
                         validated_count += 1;
                     }
+                    compat_progress.inc(&r.rel_path, r.content.len() as u64);
                 }
             }
-            progress.inc(&r.rel_path, r.content.len() as u64);
         }
-    }
-    progress.finish();
+        compat_progress.finish();
 
-    // Store empty directories
-    for rel_dir in &empty_dirs {
-        let grp = ensure_group(&h5f, rel_dir);
-        grp.new_attr::<u8>()
-            .shape(())
-            .create("empty_dir")
-            .expect("Failed to create empty_dir attr")
-            .write_scalar(&1u8)
-            .expect("Failed to write empty_dir attr");
-        if verbose_file {
-            println!("Storing empty dir: {}", rel_dir);
+        // Store empty directories
+        for rel_dir in &empty_dirs {
+            let grp = ensure_group(&h5f, rel_dir);
+            grp.new_attr::<u8>()
+                .shape(())
+                .create("empty_dir")
+                .expect("Failed to create empty_dir attr")
+                .write_scalar(&1u8)
+                .expect("Failed to write empty_dir attr");
+            if verbose_file {
+                println!("Storing empty dir: {}", rel_dir);
+            }
         }
     }
 
