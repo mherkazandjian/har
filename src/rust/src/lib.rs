@@ -102,7 +102,7 @@ impl Progress {
                          human_size_bytes(self.total)).ok();
                 lines += 1;
                 for f in &self.recent {
-                    writeln!(err, "\x1b[2K    {}", f).ok();
+                    writeln!(err, "\x1b[2K    \u{2713} {}", f).ok();
                     lines += 1;
                 }
             }

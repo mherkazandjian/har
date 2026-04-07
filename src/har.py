@@ -107,7 +107,7 @@ class ProgressBar:
             sys.stderr.write(f'\x1b[2K  {self.label:12s} [{"█" * filled}{"░" * empty}] {pct:.1f}% ({cur_h} / {tot_h})\n')
             lines += 1
             for f in self.recent:
-                sys.stderr.write(f'\x1b[2K    {f}\n')
+                sys.stderr.write(f'\x1b[2K    \u2713 {f}\n')
                 lines += 1
         self.prev_lines = lines
         sys.stderr.flush()
