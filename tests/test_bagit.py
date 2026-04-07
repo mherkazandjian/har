@@ -10,6 +10,7 @@ from har_bagit import (
     pack_bagit, extract_bagit, list_bagit, build_inventory,
     is_bagit_archive, parse_batch_size, HAR_FORMAT_VALUE, INDEX_DTYPE,
 )
+from har import validate_roundtrip, delete_source_files
 
 
 # ---------------------------------------------------------------------------
@@ -493,3 +494,113 @@ def test_error_nonexistent_archive():
         extract_bagit("/tmp/nonexistent_har_bagit_test.h5", "/tmp")
     with pytest.raises(SystemExit):
         list_bagit("/tmp/nonexistent_har_bagit_test.h5")
+
+
+# ---------------------------------------------------------------------------
+# Validate during creation tests
+# ---------------------------------------------------------------------------
+
+def test_validate_on_creation(test_env):
+    """--validate during pack_bagit verifies written data."""
+    pack_bagit([test_env['src_dir']], test_env['archive_path'], validate=True)
+    assert os.path.exists(test_env['archive_path'])
+
+    # Should be a valid bagit archive
+    assert is_bagit_archive(test_env['archive_path'])
+
+
+def test_validate_on_creation_with_checksum(test_env):
+    """--validate with explicit md5 checksum during pack_bagit."""
+    pack_bagit([test_env['src_dir']], test_env['archive_path'],
+               checksum='md5', validate=True)
+
+    with h5py.File(test_env['archive_path'], 'r') as h5f:
+        assert h5f.attrs.get('har_checksum_algo') == 'md5'
+
+
+def test_validate_extraction_success_message(test_env):
+    """--validate on extraction with no corruption should pass."""
+    pack_bagit([test_env['src_dir']], test_env['archive_path'])
+    extract_bagit(test_env['archive_path'], test_env['extract_dir'],
+                  validate=True)
+
+    f1 = os.path.join(test_env['extract_dir'], "src", "file1.txt")
+    assert open(f1).read() == "This is file 1."
+
+
+# ---------------------------------------------------------------------------
+# Validate roundtrip tests (BagIt)
+# ---------------------------------------------------------------------------
+
+def test_validate_roundtrip_bagit(test_env):
+    """validate_roundtrip with bagit=True should pass."""
+    pack_bagit([test_env['src_dir']], test_env['archive_path'])
+    result = validate_roundtrip(test_env['archive_path'],
+                                [test_env['src_dir']], bagit=True)
+    assert result is True
+
+
+def test_validate_roundtrip_bagit_byte_for_byte(test_env):
+    """validate_roundtrip with bagit + byte_for_byte."""
+    pack_bagit([test_env['src_dir']], test_env['archive_path'])
+    result = validate_roundtrip(test_env['archive_path'],
+                                [test_env['src_dir']], bagit=True,
+                                byte_for_byte=True)
+    assert result is True
+
+
+def test_validate_roundtrip_bagit_detects_mismatch():
+    """validate_roundtrip detects modified source after bagit archival."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "src")
+        os.makedirs(src)
+        with open(os.path.join(src, "data.txt"), "w") as f:
+            f.write("original")
+
+        archive = os.path.join(tmp, "test.h5")
+        pack_bagit([src], archive)
+
+        # Modify source after archival
+        with open(os.path.join(src, "data.txt"), "w") as f:
+            f.write("modified")
+
+        result = validate_roundtrip(archive, [src], bagit=True)
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Delete source tests (BagIt)
+# ---------------------------------------------------------------------------
+
+def test_delete_source_after_bagit():
+    """delete_source_files works after bagit archival."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "todelete")
+        os.makedirs(src)
+        with open(os.path.join(src, "f.txt"), "w") as f:
+            f.write("data")
+
+        archive = os.path.join(tmp, "test.h5")
+        pack_bagit([src], archive)
+        assert os.path.exists(src)
+
+        delete_source_files([src])
+        assert not os.path.exists(src)
+
+
+def test_delete_source_after_bagit_validate():
+    """delete_source deferred after bagit validate + roundtrip."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "validated")
+        os.makedirs(src)
+        with open(os.path.join(src, "f.txt"), "w") as f:
+            f.write("data")
+
+        archive = os.path.join(tmp, "test.h5")
+        pack_bagit([src], archive, validate=True)
+
+        result = validate_roundtrip(archive, [src], bagit=True)
+        assert result is True
+
+        delete_source_files([src])
+        assert not os.path.exists(src)

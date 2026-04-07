@@ -280,7 +280,8 @@ def _generate_tagmanifest(tag_files, algo='sha256'):
 
 def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
                shuffle=False, batch_size=DEFAULT_BATCH_SIZE, parallel=1,
-               verbose=False, checksum=None, xattr_flag=False):
+               verbose=False, checksum=None, xattr_flag=False,
+               validate=False):
     """Create a BagIt-mode HDF5 archive with batched storage."""
     output_h5 = os.path.expanduser(output_h5)
     t0 = time.time()
@@ -437,6 +438,31 @@ def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
           f"{_human_size(total_bytes)} payload, "
           f"archive: {_human_size(os.path.getsize(output_h5))}")
 
+    if validate:
+        errors = []
+        with h5py.File(output_h5, 'r') as h5v:
+            v_index = h5v['index'][()]
+            for rec in v_index:
+                batch_id = int(rec['batch_id'])
+                offset = int(rec['offset'])
+                length = int(rec['length'])
+                stored_sha = rec['sha256'].decode('ascii')
+                path = rec['path'].decode('utf-8')
+                batch_data = h5v[f'batches/{batch_id}'][()]
+                file_bytes = batch_data[offset:offset + length].tobytes()
+                actual = _checksum_bytes(file_bytes, hash_algo)
+                if actual != stored_sha:
+                    errors.append(path)
+        if errors:
+            print(f"VALIDATION FAILED on {len(errors)} file(s):", file=sys.stderr)
+            for e in errors[:10]:
+                print(f"  {e}", file=sys.stderr)
+            if len(errors) > 10:
+                print(f"  ... and {len(errors) - 10} more", file=sys.stderr)
+            sys.exit(1)
+        else:
+            print(f"Validation passed. {file_count} files verified.")
+
 
 # ---------------------------------------------------------------------------
 # Extract
@@ -520,6 +546,8 @@ def extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
                 if actual != sha256:
                     print(f"CHECKSUM MISMATCH: {out_path}", file=sys.stderr)
                     sys.exit(1)
+                else:
+                    print("Validation passed. 1 file verified.")
             # Restore xattrs
             rel_key = rec['path'].decode('utf-8').removeprefix('data/')
             if xattr_flag and rel_key in user_metadata:
@@ -671,6 +699,8 @@ def extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
         if len(errors) > 10:
             print(f"  ... and {len(errors) - 10} more", file=sys.stderr)
         sys.exit(1)
+    elif validate:
+        print(f"Validation passed. {file_count} files verified.")
 
     print("Extraction complete!")
 

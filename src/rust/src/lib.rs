@@ -320,6 +320,7 @@ pub fn pack_or_append_to_h5(
     verbose: bool,
     checksum: Option<&str>,
     xattr_flag: bool,
+    validate: bool,
 ) {
     let output_h5 = shellexpand::tilde(output_h5).to_string();
     let t0 = Instant::now();
@@ -400,6 +401,8 @@ pub fn pack_or_append_to_h5(
 
     let mut progress = Progress::new(if verbose { file_entries.len() } else { 0 });
     let verbose_file = verbose && !progress.is_tty;
+    let mut validation_errors: Vec<String> = Vec::new();
+    let mut validated_count: usize = 0;
 
     let write_to_h5 =
         |h5f: &hdf5::File, rel_path: &str, content: &[u8], mode: u32,
@@ -449,6 +452,18 @@ pub fn pack_or_append_to_h5(
         for entry in &file_entries {
             let fd = read_file(&entry.file_path).expect("Failed to read file");
             write_to_h5(&h5f, &entry.rel_path, &fd.content, fd.mode, fd.uid, fd.gid, &fd.owner, &fd.group, fd.mtime, true, Some(&entry.file_path));
+            if validate {
+                if let Some(algo) = checksum {
+                    let readback = read_dataset_content(&h5f.dataset(&entry.rel_path).unwrap());
+                    let actual = compute_checksum(&readback, algo);
+                    let expected = compute_checksum(&fd.content, algo);
+                    if actual != expected {
+                        validation_errors.push(entry.rel_path.clone());
+                    } else {
+                        validated_count += 1;
+                    }
+                }
+            }
             progress.inc(&entry.rel_path);
         }
     } else {
@@ -491,6 +506,18 @@ pub fn pack_or_append_to_h5(
 
         for r in &read_results {
             write_to_h5(&h5f, &r.rel_path, &r.content, r.mode, r.uid, r.gid, &r.owner, &r.group, r.mtime, false, Some(&r.file_path));
+            if validate {
+                if let Some(algo) = checksum {
+                    let readback = read_dataset_content(&h5f.dataset(&r.rel_path).unwrap());
+                    let actual = compute_checksum(&readback, algo);
+                    let expected = compute_checksum(&r.content, algo);
+                    if actual != expected {
+                        validation_errors.push(r.rel_path.clone());
+                    } else {
+                        validated_count += 1;
+                    }
+                }
+            }
             progress.inc(&r.rel_path);
         }
     }
@@ -513,6 +540,18 @@ pub fn pack_or_append_to_h5(
     h5f.close().ok();
     let elapsed = t0.elapsed().as_secs_f64();
     println!("\nOperation completed in {:.2} seconds.", elapsed);
+    if validate && !validation_errors.is_empty() {
+        eprintln!("VALIDATION FAILED on {} file(s):", validation_errors.len());
+        for e in validation_errors.iter().take(10) {
+            eprintln!("  {}", e);
+        }
+        if validation_errors.len() > 10 {
+            eprintln!("  ... and {} more", validation_errors.len() - 10);
+        }
+        std::process::exit(1);
+    } else if validate && validated_count > 0 {
+        println!("Validation passed. {} files verified.", validated_count);
+    }
 }
 
 /// Types of HDF5 objects we encounter during visitation.
@@ -776,6 +815,11 @@ pub fn extract_h5_to_directory(
             eprintln!("  ... and {} more", checksum_errors.len() - 10);
         }
         std::process::exit(1);
+    } else if validate {
+        let count = if file_key.is_some() { 1 } else {
+            collect_items(&h5f).iter().filter(|(_, t)| matches!(t, H5ObjType::Dataset)).count()
+        };
+        println!("Validation passed. {} files verified.", count);
     }
 
     println!("Extraction complete!");
@@ -810,6 +854,143 @@ pub fn list_h5_contents(h5_path: &str) {
     for key in &keys {
         println!("{}", key);
     }
+}
+
+/// Extract archive to temp dir and compare against source files.
+pub fn validate_roundtrip(
+    h5_path: &str,
+    sources: &[&str],
+    bagit: bool,
+    _verbose: bool,
+    byte_for_byte: bool,
+    checksum_algo: &str,
+) -> bool {
+    // Build source_map: rel_path -> abs_source_path
+    let mut source_map: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
+    for source in sources {
+        let source = shellexpand::tilde(source).to_string();
+        let source_path = Path::new(&source);
+        if source_path.is_dir() {
+            let source_norm = source_path
+                .canonicalize()
+                .unwrap_or_else(|_| source_path.to_path_buf());
+            let base_dir = source_norm
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_path_buf();
+            for entry in WalkDir::new(&source_norm)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                if entry.path().is_file() {
+                    let rel = pathdiff::diff_paths(entry.path(), &base_dir)
+                        .unwrap_or_else(|| entry.path().to_path_buf());
+                    source_map.insert(
+                        rel.to_string_lossy().to_string(),
+                        entry.path().to_path_buf(),
+                    );
+                }
+            }
+        } else if source_path.is_file() {
+            source_map.insert(
+                source_path.file_name().unwrap().to_string_lossy().to_string(),
+                source_path.to_path_buf(),
+            );
+        }
+    }
+
+    // Create temp dir in CWD
+    let tmp_dir = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let name = format!(".har_roundtrip_{}", ts);
+        let p = PathBuf::from(&name);
+        fs::create_dir_all(&p).expect("Failed to create roundtrip temp dir");
+        p
+    };
+
+    // Extract
+    let tmp_str = tmp_dir.to_string_lossy().to_string();
+    if bagit {
+        bagit::extract_bagit(h5_path, &tmp_str, None, false, false, 1, false, false, false);
+    } else {
+        extract_h5_to_directory(h5_path, &tmp_str, None, 1, false, false, None, false, false);
+    }
+
+    // Compare
+    let mut errors: Vec<String> = Vec::new();
+    let mut verified: usize = 0;
+
+    for (rel_path, src_path) in &source_map {
+        let extracted = tmp_dir.join(rel_path);
+        if !extracted.exists() {
+            errors.push(format!("MISSING: {}", rel_path));
+            continue;
+        }
+        let src_data = fs::read(src_path).expect("Failed to read source file");
+        let ext_data = fs::read(&extracted).expect("Failed to read extracted file");
+
+        if byte_for_byte {
+            if src_data != ext_data {
+                errors.push(format!("MISMATCH: {}", rel_path));
+            } else {
+                verified += 1;
+            }
+        } else {
+            let h1 = compute_checksum(&src_data, checksum_algo);
+            let h2 = compute_checksum(&ext_data, checksum_algo);
+            if h1 != h2 {
+                errors.push(format!("MISMATCH: {}", rel_path));
+            } else {
+                verified += 1;
+            }
+        }
+    }
+
+    // Cleanup
+    fs::remove_dir_all(&tmp_dir).ok();
+
+    if errors.is_empty() {
+        println!("Roundtrip validation passed. {} files verified.", verified);
+        true
+    } else {
+        eprintln!("ROUNDTRIP VALIDATION FAILED on {} file(s):", errors.len());
+        for e in errors.iter().take(10) {
+            eprintln!("  {}", e);
+        }
+        if errors.len() > 10 {
+            eprintln!("  ... and {} more", errors.len() - 10);
+        }
+        false
+    }
+}
+
+/// Delete source files/directories after successful archival.
+pub fn delete_source_files(sources: &[&str], verbose: bool) {
+    let mut deleted = 0;
+    for source in sources {
+        let source = shellexpand::tilde(source).to_string();
+        let path = Path::new(&source);
+        let result = if path.is_dir() {
+            fs::remove_dir_all(path)
+        } else if path.is_file() {
+            fs::remove_file(path)
+        } else {
+            continue;
+        };
+        match result {
+            Ok(_) => {
+                deleted += 1;
+                if verbose {
+                    println!("Deleted: {}", source);
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: could not delete '{}': {}", source, e);
+            }
+        }
+    }
+    println!("Deleted {} source(s).", deleted);
 }
 
 pub mod bagit;

@@ -277,6 +277,7 @@ pub fn pack_bagit(
     verbose: bool,
     checksum: Option<&str>,
     xattr_flag: bool,
+    validate: bool,
 ) {
     let output_h5 = shellexpand::tilde(output_h5).to_string();
     let t0 = Instant::now();
@@ -562,6 +563,54 @@ pub fn pack_bagit(
     println!("  {} files in {} batches, {} payload, archive: {}",
              file_count, batches.len(), human_size(total_bytes),
              human_size(fs::metadata(&output_h5).map(|m| m.len() as usize).unwrap_or(0)));
+
+    if validate {
+        let h5v = hdf5::File::open(&output_h5)
+            .unwrap_or_else(|e| panic!("Failed to reopen '{}' for validation: {}", output_h5, e));
+        let idx = h5v.group("index_data").expect("Missing index_data group");
+        let count_v = idx.attr("count").unwrap().read_scalar::<u64>().unwrap() as usize;
+        let v_batch_ids: Vec<u32> = idx.dataset("batch_id").unwrap().read_raw().unwrap();
+        let v_offsets: Vec<u64> = idx.dataset("offset").unwrap().read_raw().unwrap();
+        let v_lengths: Vec<u64> = idx.dataset("length").unwrap().read_raw().unwrap();
+        let v_paths_blob: Vec<u8> = idx.dataset("paths").unwrap().read_raw().unwrap();
+        let v_shas_blob: Vec<u8> = idx.dataset("sha256s").unwrap().read_raw().unwrap();
+        let v_paths_str = String::from_utf8(v_paths_blob).unwrap();
+        let v_paths: Vec<&str> = v_paths_str.split('\n').collect();
+        let v_shas_str = String::from_utf8(v_shas_blob).unwrap();
+        let v_shas: Vec<&str> = v_shas_str.split('\n').collect();
+
+        let mut val_errors: Vec<String> = Vec::new();
+        // Cache batch data to avoid re-reading
+        let mut batch_cache: std::collections::BTreeMap<u32, Vec<u8>> = std::collections::BTreeMap::new();
+        for i in 0..count_v {
+            let bid = v_batch_ids[i];
+            let batch_data = batch_cache.entry(bid).or_insert_with(|| {
+                let ds = h5v.dataset(&format!("batches/{}", bid)).unwrap();
+                crate::read_dataset_content(&ds)
+            });
+            let off = v_offsets[i] as usize;
+            let len = v_lengths[i] as usize;
+            let file_bytes = &batch_data[off..off + len];
+            let actual = crate::compute_checksum(file_bytes, hash_algo);
+            if actual != v_shas[i] {
+                val_errors.push(v_paths[i].to_string());
+            }
+        }
+        h5v.close().ok();
+
+        if !val_errors.is_empty() {
+            eprintln!("VALIDATION FAILED on {} file(s):", val_errors.len());
+            for e in val_errors.iter().take(10) {
+                eprintln!("  {}", e);
+            }
+            if val_errors.len() > 10 {
+                eprintln!("  ... and {} more", val_errors.len() - 10);
+            }
+            std::process::exit(1);
+        } else {
+            println!("Validation passed. {} files verified.", file_count);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -651,6 +700,8 @@ pub fn extract_bagit(
                     if actual != shas[i] {
                         eprintln!("CHECKSUM MISMATCH: {}", out_path);
                         std::process::exit(1);
+                    } else {
+                        println!("Validation passed. 1 file verified.");
                     }
                 }
 
@@ -841,6 +892,8 @@ pub fn extract_bagit(
         for e in errors.iter().take(10) { eprintln!("  {}", e); }
         if errors.len() > 10 { eprintln!("  ... and {} more", errors.len() - 10); }
         std::process::exit(1);
+    } else if validate {
+        println!("Validation passed. {} files verified.", count);
     }
 
     println!("Extraction complete!");

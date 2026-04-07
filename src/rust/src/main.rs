@@ -71,16 +71,29 @@ struct Cli {
     #[arg(long = "batch-size", default_value = "64M")]
     batch_size: String,
 
-    /// Verify SHA-256 checksums on extraction (--bagit mode only)
+    /// Verify checksums on extraction and creation
     #[arg(long = "validate")]
     validate: bool,
+
+    /// After creation, extract and compare against source files
+    #[arg(long = "validate-roundtrip")]
+    validate_roundtrip: bool,
+
+    /// Use byte-for-byte comparison for --validate-roundtrip (default: checksum)
+    #[arg(long = "byte-for-byte")]
+    byte_for_byte: bool,
+
+    /// Delete source files after successful ingestion
+    #[arg(long = "delete-source")]
+    delete_source: bool,
 
     /// Extract as a full BagIt bag with tag files (--bagit mode only)
     #[arg(long = "bagit-raw")]
     bagit_raw: bool,
 
-    /// Checksum algorithm for integrity verification (md5, sha256, blake3)
-    #[arg(long = "checksum", value_parser = ["md5", "sha256", "blake3"])]
+    /// Checksum algorithm for integrity verification (default: sha256 if flag given without value)
+    #[arg(long = "checksum", value_parser = ["md5", "sha256", "blake3"],
+          num_args = 0..=1, default_missing_value = "sha256")]
     checksum: Option<String>,
 
     /// Write metadata.json manifest of user HDF5 attributes on extraction
@@ -125,7 +138,12 @@ fn main() {
         (None, None)
     };
 
-    let checksum = cli.checksum.as_deref();
+    // If --validate during creation, implicitly enable sha256 checksums
+    let mut checksum_val = cli.checksum.clone();
+    if (cli.create || cli.append) && cli.validate && checksum_val.is_none() {
+        checksum_val = Some("sha256".to_string());
+    }
+    let checksum = checksum_val.as_deref();
 
     // --- BagIt mode ---
     if cli.bagit {
@@ -145,7 +163,25 @@ fn main() {
             har::bagit::pack_bagit(
                 &sources, &cli.file, compression, compression_opts,
                 cli.shuffle, bs, cli.parallel, cli.verbose, checksum, cli.xattr,
+                cli.validate,
             );
+            let validation_ok = if cli.validate_roundtrip {
+                let ok = har::validate_roundtrip(
+                    &cli.file, &sources, true, cli.verbose, cli.byte_for_byte,
+                    checksum.unwrap_or("sha256"),
+                );
+                if !ok { std::process::exit(1); }
+                ok
+            } else {
+                true
+            };
+            if cli.delete_source {
+                if validation_ok {
+                    har::delete_source_files(&sources, cli.verbose);
+                } else {
+                    eprintln!("Skipping source deletion: validation failed.");
+                }
+            }
         } else if cli.extract {
             let file_key = if cli.path.is_empty() { None } else { Some(cli.path[0].as_str()) };
             har::bagit::extract_bagit(
@@ -185,7 +221,25 @@ fn main() {
         har::pack_or_append_to_h5(
             &sources, &cli.file, "w", compression, compression_opts,
             cli.shuffle, cli.parallel, cli.verbose, checksum, cli.xattr,
+            cli.validate,
         );
+        let validation_ok = if cli.validate_roundtrip {
+            let ok = har::validate_roundtrip(
+                &cli.file, &sources, false, cli.verbose, cli.byte_for_byte,
+                checksum.unwrap_or("sha256"),
+            );
+            if !ok { std::process::exit(1); }
+            ok
+        } else {
+            true
+        };
+        if cli.delete_source {
+            if validation_ok {
+                har::delete_source_files(&sources, cli.verbose);
+            } else {
+                eprintln!("Skipping source deletion: validation failed.");
+            }
+        }
     } else if cli.append {
         if cli.path.is_empty() {
             eprintln!("Error: At least one source (directory or file) is required for appending (-r).");
@@ -195,7 +249,25 @@ fn main() {
         har::pack_or_append_to_h5(
             &sources, &cli.file, "a", compression, compression_opts,
             cli.shuffle, cli.parallel, cli.verbose, checksum, cli.xattr,
+            cli.validate,
         );
+        let validation_ok = if cli.validate_roundtrip {
+            let ok = har::validate_roundtrip(
+                &cli.file, &sources, false, cli.verbose, cli.byte_for_byte,
+                checksum.unwrap_or("sha256"),
+            );
+            if !ok { std::process::exit(1); }
+            ok
+        } else {
+            true
+        };
+        if cli.delete_source {
+            if validation_ok {
+                har::delete_source_files(&sources, cli.verbose);
+            } else {
+                eprintln!("Skipping source deletion: validation failed.");
+            }
+        }
     } else if cli.extract {
         let file_key = if cli.path.is_empty() { None } else { Some(cli.path[0].as_str()) };
         har::extract_h5_to_directory(

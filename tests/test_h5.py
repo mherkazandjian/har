@@ -6,7 +6,8 @@ import pytest
 from io import StringIO
 import contextlib
 
-from har import pack_or_append_to_h5, extract_h5_to_directory, list_h5_contents
+from har import (pack_or_append_to_h5, extract_h5_to_directory, list_h5_contents,
+                 validate_roundtrip, delete_source_files)
 
 @pytest.fixture
 def test_env():
@@ -466,3 +467,146 @@ def test_parallel_many_small_files():
                 p = os.path.join(extract_dir, "many", f"dir{i}", f"file{j}.txt")
                 with open(p) as f:
                     assert f.read() == f"content dir{i}/file{j}"
+
+
+# ---- Validate during creation tests ----
+
+def test_validate_on_creation(test_env):
+    """--validate during creation should verify written data and not raise."""
+    pack_or_append_to_h5([test_env['src_dir']], test_env['archive_path'], 'w',
+                         checksum='sha256', validate=True)
+    assert os.path.exists(test_env['archive_path'])
+
+    # Verify checksums are stored
+    with h5py.File(test_env['archive_path'], 'r') as h5f:
+        ds = h5f['src/file1.txt']
+        assert 'har_checksum' in ds.attrs
+        assert 'har_checksum_algo' in ds.attrs
+        assert ds.attrs['har_checksum_algo'] == 'sha256'
+
+
+def test_validate_on_creation_md5(test_env):
+    """--validate with md5 during creation."""
+    pack_or_append_to_h5([test_env['src_dir']], test_env['archive_path'], 'w',
+                         checksum='md5', validate=True)
+    with h5py.File(test_env['archive_path'], 'r') as h5f:
+        assert h5f['src/file1.txt'].attrs['har_checksum_algo'] == 'md5'
+
+
+def test_validate_on_append(test_env):
+    """--validate during append verifies newly written data."""
+    pack_or_append_to_h5([test_env['src_dir']], test_env['archive_path'], 'w',
+                         checksum='sha256')
+
+    file3 = os.path.join(test_env['src_dir'], "file3.txt")
+    with open(file3, "w") as f:
+        f.write("This is file 3.")
+
+    pack_or_append_to_h5([file3], test_env['archive_path'], 'a',
+                         checksum='sha256', validate=True)
+
+
+# ---- Validate roundtrip tests ----
+
+def test_validate_roundtrip_checksum(test_env):
+    """validate_roundtrip with checksum comparison should pass."""
+    pack_or_append_to_h5([test_env['src_dir']], test_env['archive_path'], 'w')
+    result = validate_roundtrip(test_env['archive_path'],
+                                [test_env['src_dir']])
+    assert result is True
+
+
+def test_validate_roundtrip_byte_for_byte(test_env):
+    """validate_roundtrip with byte-for-byte comparison should pass."""
+    pack_or_append_to_h5([test_env['src_dir']], test_env['archive_path'], 'w')
+    result = validate_roundtrip(test_env['archive_path'],
+                                [test_env['src_dir']],
+                                byte_for_byte=True)
+    assert result is True
+
+
+def test_validate_roundtrip_detects_mismatch():
+    """validate_roundtrip detects modified source after archival."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "src")
+        os.makedirs(src)
+        f1 = os.path.join(src, "data.txt")
+        with open(f1, "w") as f:
+            f.write("original")
+
+        archive = os.path.join(tmp, "test.h5")
+        pack_or_append_to_h5([src], archive, 'w')
+
+        # Modify source after archival
+        with open(f1, "w") as f:
+            f.write("modified")
+
+        result = validate_roundtrip(archive, [src])
+        assert result is False
+
+
+def test_validate_roundtrip_with_binary():
+    """validate_roundtrip works with binary files."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "bin")
+        os.makedirs(src)
+        with open(os.path.join(src, "data.bin"), "wb") as f:
+            f.write(bytes(range(256)))
+
+        archive = os.path.join(tmp, "test.h5")
+        pack_or_append_to_h5([src], archive, 'w')
+
+        result = validate_roundtrip(archive, [src], byte_for_byte=True)
+        assert result is True
+
+
+# ---- Delete source tests ----
+
+def test_delete_source_directory():
+    """delete_source_files removes directories."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "todelete")
+        os.makedirs(src)
+        with open(os.path.join(src, "f.txt"), "w") as f:
+            f.write("data")
+
+        archive = os.path.join(tmp, "test.h5")
+        pack_or_append_to_h5([src], archive, 'w')
+        assert os.path.exists(src)
+
+        delete_source_files([src])
+        assert not os.path.exists(src)
+
+
+def test_delete_source_file():
+    """delete_source_files removes individual files."""
+    with tempfile.TemporaryDirectory() as tmp:
+        f1 = os.path.join(tmp, "single.txt")
+        with open(f1, "w") as f:
+            f.write("data")
+
+        archive = os.path.join(tmp, "test.h5")
+        pack_or_append_to_h5([f1], archive, 'w')
+        assert os.path.exists(f1)
+
+        delete_source_files([f1])
+        assert not os.path.exists(f1)
+
+
+def test_delete_source_after_validate():
+    """delete_source deferred until after validation passes."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "validated")
+        os.makedirs(src)
+        with open(os.path.join(src, "f.txt"), "w") as f:
+            f.write("data")
+
+        archive = os.path.join(tmp, "test.h5")
+        pack_or_append_to_h5([src], archive, 'w', checksum='sha256',
+                             validate=True)
+
+        result = validate_roundtrip(archive, [src])
+        assert result is True
+
+        delete_source_files([src])
+        assert not os.path.exists(src)

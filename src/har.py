@@ -265,7 +265,8 @@ def pack_or_append_to_h5(sources,
                          parallel=1,
                          verbose=False,
                          checksum=None,
-                         xattr_flag=False):
+                         xattr_flag=False,
+                         validate=False):
     """
     Archive or append the given sources (directories and/or files) into the HDF5 archive.
 
@@ -278,6 +279,7 @@ def pack_or_append_to_h5(sources,
     :param parallel: Number of parallel workers for file reads (default: 1).
     :param verbose: Print filenames as they are processed (default: False).
     :param checksum: Checksum algorithm (md5, sha256, blake3) or None.
+    :param validate: Verify written data by reading back and comparing checksums.
     """
     output_h5 = os.path.expanduser(output_h5)
     t0 = time.time()
@@ -306,6 +308,8 @@ def pack_or_append_to_h5(sources,
 
     progress = ProgressBar(len(file_entries) if verbose else 0)
     verbose_file = verbose and not progress.is_tty
+    validation_errors = []
+    validated_count = [0]
 
     def _write_to_h5(h5fobj, rel_path, content, mode, uid=0, gid=0,
                      owner='', group='', mtime=0.0,
@@ -339,6 +343,13 @@ def pack_or_append_to_h5(sources,
         if checksum:
             ds.attrs['har_checksum'] = compute_checksum(content, checksum)
             ds.attrs['har_checksum_algo'] = checksum
+        if validate and checksum:
+            readback = h5fobj[rel_path][()].tobytes()
+            actual = compute_checksum(readback, checksum)
+            if actual != ds.attrs['har_checksum']:
+                validation_errors.append(rel_path)
+            else:
+                validated_count[0] += 1
         if xattr_flag and src_path:
             xattrs = _read_xattrs(src_path)
             for name, value in xattrs.items():
@@ -394,6 +405,105 @@ def pack_or_append_to_h5(sources,
 
     t1 = time.time()
     print(f"\nOperation completed in {t1 - t0:.2f} seconds.")
+    if validate and validation_errors:
+        print(f"VALIDATION FAILED on {len(validation_errors)} file(s):", file=sys.stderr)
+        for e in validation_errors[:10]:
+            print(f"  {e}", file=sys.stderr)
+        if len(validation_errors) > 10:
+            print(f"  ... and {len(validation_errors) - 10} more", file=sys.stderr)
+        sys.exit(1)
+    elif validate and validated_count[0] > 0:
+        print(f"Validation passed. {validated_count[0]} files verified.")
+
+def validate_roundtrip(h5_path, sources, bagit=False, verbose=False,
+                       byte_for_byte=False, checksum='sha256'):
+    """Extract archive to temp dir and compare against source files."""
+    import tempfile
+    import shutil
+
+    # Build source_map: {rel_path: abs_source_path}
+    source_map = {}
+    for source in sources:
+        source = os.path.expanduser(source)
+        if os.path.isdir(source):
+            source = os.path.normpath(source)
+            base_dir = os.path.dirname(os.path.abspath(source))
+            for root, dirs, files in os.walk(source):
+                for fname in files:
+                    file_path = os.path.join(root, fname)
+                    rel_path = os.path.relpath(file_path, base_dir)
+                    source_map[rel_path] = file_path
+        elif os.path.isfile(source):
+            source_map[os.path.basename(source)] = source
+
+    tmp_dir = tempfile.mkdtemp(dir='.', prefix='.har_roundtrip_')
+    try:
+        # Extract archive to temp dir
+        if bagit:
+            from har_bagit import extract_bagit
+            extract_bagit(h5_path, tmp_dir)
+        else:
+            extract_h5_to_directory(h5_path, tmp_dir)
+
+        # Compare
+        errors = []
+        verified = 0
+        for rel_path, src_path in source_map.items():
+            extracted = os.path.join(tmp_dir, rel_path)
+            if not os.path.exists(extracted):
+                errors.append(f"MISSING: {rel_path}")
+                continue
+            if byte_for_byte:
+                with open(src_path, 'rb') as f1, open(extracted, 'rb') as f2:
+                    if f1.read() != f2.read():
+                        errors.append(f"MISMATCH: {rel_path}")
+                    else:
+                        verified += 1
+            else:
+                with open(src_path, 'rb') as f1, open(extracted, 'rb') as f2:
+                    h1 = compute_checksum(f1.read(), checksum)
+                    h2 = compute_checksum(f2.read(), checksum)
+                    if h1 != h2:
+                        errors.append(f"MISMATCH: {rel_path}")
+                    else:
+                        verified += 1
+
+        if errors:
+            print(f"ROUNDTRIP VALIDATION FAILED on {len(errors)} file(s):",
+                  file=sys.stderr)
+            for e in errors[:10]:
+                print(f"  {e}", file=sys.stderr)
+            if len(errors) > 10:
+                print(f"  ... and {len(errors) - 10} more", file=sys.stderr)
+            return False
+        else:
+            print(f"Roundtrip validation passed. {verified} files verified.")
+            return True
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def delete_source_files(sources, verbose=False):
+    """Delete source files/directories after successful archival."""
+    import shutil
+    deleted = 0
+    for source in sources:
+        source = os.path.expanduser(source)
+        try:
+            if os.path.isdir(source):
+                shutil.rmtree(source)
+            elif os.path.isfile(source):
+                os.remove(source)
+            else:
+                continue
+            deleted += 1
+            if verbose:
+                print(f"Deleted: {source}")
+        except OSError as e:
+            print(f"Warning: could not delete '{source}': {e}",
+                  file=sys.stderr)
+    print(f"Deleted {deleted} source(s).")
+
 
 def extract_h5_to_directory(h5_path, extract_dir, file_key=None, parallel=1,
                             verbose=False, validate=False, checksum=None,
@@ -441,6 +551,8 @@ def extract_h5_to_directory(h5_path, extract_dir, file_key=None, parallel=1,
                 if actual != stored:
                     print(f"CHECKSUM MISMATCH ({algo}): {file_key}", file=sys.stderr)
                     sys.exit(1)
+                else:
+                    print("Validation passed. 1 file verified.")
             hdf5_attrs, xattrs_json, xattrs_raw = _collect_user_metadata(dataset)
             if xattr_flag and xattrs_raw:
                 _restore_xattrs(dest_file_path, xattrs_raw)
@@ -463,6 +575,7 @@ def extract_h5_to_directory(h5_path, extract_dir, file_key=None, parallel=1,
         if parallel <= 1:
             # Sequential full extraction.
             checksum_errors = []
+            validated_file_count = [0]
             all_metadata = {}
             with h5fobj:
                 def extract_item(name, obj):
@@ -480,6 +593,8 @@ def extract_h5_to_directory(h5_path, extract_dir, file_key=None, parallel=1,
                             actual = compute_checksum(file_bytes, algo)
                             if actual != stored:
                                 checksum_errors.append(name)
+                            else:
+                                validated_file_count[0] += 1
                         hdf5_attrs, xattrs_json, xattrs_raw = _collect_user_metadata(obj)
                         if xattr_flag and xattrs_raw:
                             _restore_xattrs(dest_file_path, xattrs_raw)
@@ -505,6 +620,8 @@ def extract_h5_to_directory(h5_path, extract_dir, file_key=None, parallel=1,
                 if len(checksum_errors) > 10:
                     print(f"  ... and {len(checksum_errors) - 10} more", file=sys.stderr)
                 sys.exit(1)
+            elif validate and validated_file_count[0] > 0:
+                print(f"Validation passed. {validated_file_count[0]} files verified.")
         else:
             # Parallel full extraction.
             # Phase 1: Bulk read all datasets from HDF5 sequentially into memory.
@@ -613,8 +730,9 @@ def main():
                         help="Use HDF5 shuffle filter before compression (off by default).")
 
     # Checksum.
-    parser.add_argument("--checksum", choices=["md5", "sha256", "blake3"],
-                        help="Checksum algorithm for integrity verification (md5, sha256, blake3).")
+    parser.add_argument("--checksum", nargs='?', const='sha256',
+                        choices=["md5", "sha256", "blake3"],
+                        help="Checksum algorithm for integrity verification (default: sha256 if flag given without value).")
 
     # Metadata extraction.
     parser.add_argument("--metadata-json", action="store_true",
@@ -632,7 +750,13 @@ def main():
     parser.add_argument("--batch-size", type=str, default="64M",
                         help="Target batch size for --bagit mode (default: 64M). Examples: 64M, 1G.")
     parser.add_argument("--validate", action="store_true",
-                        help="Verify SHA-256 checksums on extraction (--bagit mode only).")
+                        help="Verify checksums on extraction and creation.")
+    parser.add_argument("--validate-roundtrip", action="store_true",
+                        help="After creation, extract and compare against source files.")
+    parser.add_argument("--byte-for-byte", action="store_true",
+                        help="Use byte-for-byte comparison for --validate-roundtrip (default: checksum).")
+    parser.add_argument("--delete-source", action="store_true",
+                        help="Delete source files after successful ingestion.")
     parser.add_argument("--bagit-raw", action="store_true",
                         help="Extract as a full BagIt bag with tag files (--bagit mode only).")
     parser.add_argument("--mpi", action="store_true",
@@ -655,6 +779,10 @@ def main():
     h5_file = args.file
     target_dir = args.directory  # For extraction, the target directory.
     sources = args.path         # For archive/append mode, this is a list of sources.
+
+    # If --validate during creation, implicitly enable sha256 checksums
+    if (args.c or args.r) and args.validate and not args.checksum:
+        args.checksum = 'sha256'
 
     # Determine compression settings.
     compression = None
@@ -740,7 +868,22 @@ def main():
                 parallel=args.parallel,
                 verbose=args.verbose,
                 checksum=args.checksum,
-                xattr_flag=args.xattr)
+                xattr_flag=args.xattr,
+                validate=args.validate)
+            validation_ok = True
+            if args.validate_roundtrip:
+                validation_ok = validate_roundtrip(
+                    h5_file, sources, bagit=True, verbose=args.verbose,
+                    byte_for_byte=args.byte_for_byte,
+                    checksum=args.checksum or 'sha256')
+                if not validation_ok:
+                    sys.exit(1)
+            if args.delete_source:
+                if validation_ok:
+                    delete_source_files(sources, verbose=args.verbose)
+                else:
+                    print("Skipping source deletion: validation failed.",
+                          file=sys.stderr)
         elif args.x:
             file_key = sources[0] if sources else None
             extract_bagit(
@@ -804,7 +947,22 @@ def main():
             parallel=args.parallel,
             verbose=args.verbose,
             checksum=args.checksum,
-            xattr_flag=args.xattr)
+            xattr_flag=args.xattr,
+            validate=args.validate)
+        validation_ok = True
+        if args.validate_roundtrip:
+            validation_ok = validate_roundtrip(
+                h5_file, sources, bagit=False, verbose=args.verbose,
+                byte_for_byte=args.byte_for_byte,
+                checksum=args.checksum or 'sha256')
+            if not validation_ok:
+                sys.exit(1)
+        if args.delete_source:
+            if validation_ok:
+                delete_source_files(sources, verbose=args.verbose)
+            else:
+                print("Skipping source deletion: validation failed.",
+                      file=sys.stderr)
     elif args.r:
         # Append to archive.
         if not sources:
@@ -820,7 +978,22 @@ def main():
             parallel=args.parallel,
             verbose=args.verbose,
             checksum=args.checksum,
-            xattr_flag=args.xattr)
+            xattr_flag=args.xattr,
+            validate=args.validate)
+        validation_ok = True
+        if args.validate_roundtrip:
+            validation_ok = validate_roundtrip(
+                h5_file, sources, bagit=False, verbose=args.verbose,
+                byte_for_byte=args.byte_for_byte,
+                checksum=args.checksum or 'sha256')
+            if not validation_ok:
+                sys.exit(1)
+        if args.delete_source:
+            if validation_ok:
+                delete_source_files(sources, verbose=args.verbose)
+            else:
+                print("Skipping source deletion: validation failed.",
+                      file=sys.stderr)
     elif args.x:
         file_key = sources[0] if sources else None
         extract_h5_to_directory(h5_file, target_dir, file_key=file_key,
