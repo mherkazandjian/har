@@ -281,14 +281,17 @@ def _collect_detail_legacy(h5f, node):
         if attr_rows:
             sections.append(("ATTRIBUTES", attr_rows))
 
-        # Hex preview
-        try:
-            raw = ds[()].tobytes()[:256]
-            hex_lines = _format_hex(raw)
-            if hex_lines:
-                sections.append(("DATA PREVIEW", [(l, "") for l in hex_lines]))
-        except Exception:
-            pass
+        # Hex preview (skip for large files >10 MB)
+        if raw_size <= 10 * 1024 * 1024:
+            try:
+                raw = ds[()].tobytes()[:256]
+                hex_lines = _format_hex(raw)
+                if hex_lines:
+                    sections.append(("DATA PREVIEW", [(l, "") for l in hex_lines]))
+            except Exception:
+                pass
+        else:
+            sections.append(("DATA PREVIEW", [("(skipped, file > 10 MB)", "")]))
 
     elif node.node_type == "group":
         try:
@@ -391,15 +394,18 @@ def _collect_detail_bagit(h5f, node, is_bagit):
         except Exception:
             pass
 
-    # Hex preview
-    try:
-        batch_data = h5f[f"batches/{bid}"][()].tobytes()
-        raw = batch_data[off:off + min(length, 256)]
-        hex_lines = _format_hex(raw)
-        if hex_lines:
-            sections.append(("DATA PREVIEW", [(l, "") for l in hex_lines]))
-    except Exception:
-        pass
+    # Hex preview (skip for large files >10 MB)
+    if length <= 10 * 1024 * 1024:
+        try:
+            batch_data = h5f[f"batches/{bid}"][()].tobytes()
+            raw = batch_data[off:off + min(length, 256)]
+            hex_lines = _format_hex(raw)
+            if hex_lines:
+                sections.append(("DATA PREVIEW", [(l, "") for l in hex_lines]))
+        except Exception:
+            pass
+    else:
+        sections.append(("DATA PREVIEW", [("(skipped, file > 10 MB)", "")]))
 
     return sections
 

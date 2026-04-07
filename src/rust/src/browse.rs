@@ -647,24 +647,29 @@ fn collect_detail_legacy(h5_path: &str, path: &str, node_type: &NodeType) -> Vec
                     lines.push(DetailLine { text: String::new(), is_header: false });
                 }
 
-                // Hex preview
-                if let Ok(data) = ds.read_raw::<u8>() {
-                    let preview = &data[..data.len().min(96)];
-                    if !preview.is_empty() {
-                        lines.push(DetailLine { text: "DATA PREVIEW".into(), is_header: true});
-                        for chunk_start in (0..preview.len()).step_by(6) {
-                            let end = (chunk_start + 6).min(preview.len());
-                            let chunk = &preview[chunk_start..end];
-                            let hex: String = chunk.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-                            let ascii: String = chunk.iter().map(|&b| {
-                                if (32..127).contains(&b) { b as char } else { '.' }
-                            }).collect();
-                            lines.push(DetailLine {
-                                text: format!("  {:05x}  {:<18}  {}", chunk_start, hex, ascii),
-                                is_header: false,
-                            });
+                // Hex preview (skip for large files >10 MB)
+                if raw_size <= 10 * 1024 * 1024 {
+                    if let Ok(data) = ds.read_raw::<u8>() {
+                        let preview = &data[..data.len().min(96)];
+                        if !preview.is_empty() {
+                            lines.push(DetailLine { text: "DATA PREVIEW".into(), is_header: true});
+                            for chunk_start in (0..preview.len()).step_by(6) {
+                                let end = (chunk_start + 6).min(preview.len());
+                                let chunk = &preview[chunk_start..end];
+                                let hex: String = chunk.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                                let ascii: String = chunk.iter().map(|&b| {
+                                    if (32..127).contains(&b) { b as char } else { '.' }
+                                }).collect();
+                                lines.push(DetailLine {
+                                    text: format!("  {:05x}  {:<18}  {}", chunk_start, hex, ascii),
+                                    is_header: false,
+                                });
+                            }
                         }
                     }
+                } else {
+                    lines.push(DetailLine { text: "DATA PREVIEW".into(), is_header: true });
+                    lines.push(DetailLine { text: "  (skipped, file > 10 MB)".into(), is_header: false });
                 }
             }
         }
@@ -817,30 +822,35 @@ fn collect_detail_bagit(h5_path: &str, path: &str, node_type: &NodeType) -> Vec<
                     }
                 }
 
-                // Hex preview
-                let batch_ds_path = format!("batches/{}", bid);
-                if let Ok(batch_ds) = h5f.dataset(&batch_ds_path) {
-                    let batch_data = crate::read_dataset_content(&batch_ds);
-                    let start = off as usize;
-                    let end = (off + length.min(96)) as usize;
-                    if end <= batch_data.len() {
-                        let preview = &batch_data[start..end];
-                        if !preview.is_empty() {
-                            lines.push(DetailLine { text: "DATA PREVIEW".into(), is_header: true});
-                            for chunk_start in (0..preview.len()).step_by(6) {
-                                let chunk_end = (chunk_start + 6).min(preview.len());
-                                let chunk = &preview[chunk_start..chunk_end];
-                                let hex: String = chunk.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-                                let ascii: String = chunk.iter().map(|&b| {
-                                    if (32..127).contains(&b) { b as char } else { '.' }
-                                }).collect();
-                                lines.push(DetailLine {
-                                    text: format!("  {:05x}  {:<18}  {}", chunk_start, hex, ascii),
-                                    is_header: false,
-                                });
+                // Hex preview (skip for large files >10 MB)
+                if length <= 10 * 1024 * 1024 {
+                    let batch_ds_path = format!("batches/{}", bid);
+                    if let Ok(batch_ds) = h5f.dataset(&batch_ds_path) {
+                        let batch_data = crate::read_dataset_content(&batch_ds);
+                        let start = off as usize;
+                        let end = (off + length.min(96)) as usize;
+                        if end <= batch_data.len() {
+                            let preview = &batch_data[start..end];
+                            if !preview.is_empty() {
+                                lines.push(DetailLine { text: "DATA PREVIEW".into(), is_header: true});
+                                for chunk_start in (0..preview.len()).step_by(6) {
+                                    let chunk_end = (chunk_start + 6).min(preview.len());
+                                    let chunk = &preview[chunk_start..chunk_end];
+                                    let hex: String = chunk.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                                    let ascii: String = chunk.iter().map(|&b| {
+                                        if (32..127).contains(&b) { b as char } else { '.' }
+                                    }).collect();
+                                    lines.push(DetailLine {
+                                        text: format!("  {:05x}  {:<18}  {}", chunk_start, hex, ascii),
+                                        is_header: false,
+                                    });
+                                }
                             }
                         }
                     }
+                } else {
+                    lines.push(DetailLine { text: "DATA PREVIEW".into(), is_header: true });
+                    lines.push(DetailLine { text: "  (skipped, file > 10 MB)".into(), is_header: false });
                 }
             }
         }

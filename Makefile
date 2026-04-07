@@ -16,6 +16,16 @@ container ?= apptainer
 DOCKER_IMAGE := har-rust-build
 DOCKER_IMAGE_STATIC := har-rust-build-static
 
+# Compute version: Cargo.toml version + short git SHA for untagged builds
+PKG_VERSION := $(shell grep '^version' $(RUST_DIR)/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+GIT_TAGGED := $(shell git describe --tags --exact-match HEAD 2>/dev/null && echo yes || echo no)
+GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+ifeq ($(GIT_TAGGED),no)
+  HAR_BUILD_VERSION := $(PKG_VERSION)+g$(GIT_SHA)
+else
+  HAR_BUILD_VERSION := $(PKG_VERSION)
+endif
+
 ifeq ($(container),apptainer)
   DYNAMIC_TARGET := /tmp/har_target
   STATIC_TARGET  := /tmp/har_static_target
@@ -26,6 +36,7 @@ ifeq ($(container),apptainer)
       --env CARGO_HOME=/tmp/cargo_home \
       --env CARGO_TARGET_DIR=/tmp/target_dir \
       --env HDF5_DIR=/usr/lib/x86_64-linux-gnu/hdf5/serial \
+      --env HAR_BUILD_VERSION=$(HAR_BUILD_VERSION) \
       $(RUST_SANDBOX) bash -c
   RUN_STATIC := apptainer exec \
       --bind $(RUST_DIR):/work \
@@ -34,6 +45,7 @@ ifeq ($(container),apptainer)
       --env CARGO_HOME=/tmp/cargo_home \
       --env CARGO_TARGET_DIR=/tmp/target_dir \
       --env RUSTUP_HOME=/work/.rustup_home \
+      --env HAR_BUILD_VERSION=$(HAR_BUILD_VERSION) \
       $(RUST_STATIC_SANDBOX) bash -c
   WORKDIR := /work
   NEED_DYNAMIC_ENV := rust-sandbox-apptainer
@@ -47,10 +59,12 @@ else ifeq ($(container),docker)
       -v $(RUST_DIR):/work \
       -e CARGO_HOME=/work/.cargo_home \
       -e HDF5_DIR=/usr/lib/x86_64-linux-gnu/hdf5/serial \
+      -e HAR_BUILD_VERSION=$(HAR_BUILD_VERSION) \
       $(DOCKER_IMAGE) bash -c
   RUN_STATIC := docker run --rm \
       -v $(RUST_DIR):/work \
       -e CARGO_HOME=/work/.cargo_home \
+      -e HAR_BUILD_VERSION=$(HAR_BUILD_VERSION) \
       $(DOCKER_IMAGE_STATIC) bash -c
   WORKDIR := /work
   NEED_DYNAMIC_ENV := rust-sandbox-docker

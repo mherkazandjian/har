@@ -1,7 +1,7 @@
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "har", version = env!("CARGO_PKG_VERSION"), about = "Archive, append, extract, or list an HDF5 archive.")]
+#[command(name = "har", version = env!("HAR_VERSION"), about = "Archive, append, extract, or list an HDF5 archive.")]
 struct Cli {
     /// Create archive from one or more directories/files
     #[arg(short = 'c', group = "operation")]
