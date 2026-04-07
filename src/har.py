@@ -50,17 +50,26 @@ import numpy as np
 import time
 
 
+def _human_size(nbytes):
+    """Return a human-readable size string."""
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if nbytes < 1024:
+            return f"{nbytes:.1f} {unit}"
+        nbytes /= 1024
+    return f"{nbytes:.1f} PB"
+
+
 class ProgressBar:
-    """Simple terminal progress bar with last-5-files display."""
-    def __init__(self, total):
-        self.total = total
+    """Simple terminal progress bar based on bytes processed."""
+    def __init__(self, total_bytes):
+        self.total = total_bytes
         self.current = 0
         self.recent = []
         self.prev_lines = 0
-        self.is_tty = sys.stderr.isatty() and total > 0
+        self.is_tty = sys.stderr.isatty() and total_bytes > 0
 
-    def update(self, filename):
-        self.current += 1
+    def update(self, filename, nbytes):
+        self.current += nbytes
         self.recent.append(filename)
         if len(self.recent) > 5:
             self.recent.pop(0)
@@ -70,11 +79,13 @@ class ProgressBar:
     def _render(self):
         if self.prev_lines > 0:
             sys.stderr.write(f'\x1b[{self.prev_lines}A')
-        pct = self.current * 100 // max(self.total, 1)
+        pct = self.current * 100.0 / max(self.total, 1)
         bar_width = 40
-        filled = bar_width * self.current // max(self.total, 1)
+        filled = int(bar_width * self.current / max(self.total, 1))
         empty = bar_width - filled
-        sys.stderr.write(f'\x1b[2K[{"█" * filled}{"░" * empty}] {pct}% ({self.current}/{self.total})\n')
+        cur_h = _human_size(self.current)
+        tot_h = _human_size(self.total)
+        sys.stderr.write(f'\x1b[2K[{"█" * filled}{"░" * empty}] {pct:.1f}% ({cur_h} / {tot_h})\n')
         for f in self.recent:
             sys.stderr.write(f'\x1b[2K  {f}\n')
         self.prev_lines = 1 + len(self.recent)
@@ -306,7 +317,8 @@ def pack_or_append_to_h5(sources,
         else:
             print(f"Warning: '{source}' is not a valid file or directory; skipping.", file=sys.stderr)
 
-    progress = ProgressBar(len(file_entries) if verbose else 0)
+    total_size = sum(os.path.getsize(fp) for fp, _ in file_entries)
+    progress = ProgressBar(total_size if verbose else 0)
     verbose_file = verbose and not progress.is_tty
     validation_errors = []
     validated_count = [0]
@@ -363,7 +375,7 @@ def pack_or_append_to_h5(sources,
                 _write_to_h5(h5fobj, rel_path, content, mode,
                              uid=uid, gid=gid, owner=owner, group=group, mtime=mtime,
                              src_path=file_path)
-                progress.update(rel_path)
+                progress.update(rel_path, len(content))
             for rel_dir in empty_dirs:
                 grp = h5fobj.require_group(rel_dir)
                 grp.attrs['empty_dir'] = True
@@ -395,7 +407,7 @@ def pack_or_append_to_h5(sources,
                 _write_to_h5(h5fobj, rel_path, content, mode,
                              uid=uid, gid=gid, owner=owner, group=group, mtime=mtime,
                              create_groups=False, src_path=src_path)
-                progress.update(rel_path)
+                progress.update(rel_path, len(content))
             for rel_dir in empty_dirs:
                 grp = h5fobj.require_group(rel_dir)
                 grp.attrs['empty_dir'] = True
@@ -561,15 +573,15 @@ def extract_h5_to_directory(h5_path, extract_dir, file_key=None, parallel=1,
             if verbose:
                 print(f"Extracted: {file_key}")
     else:
-        # Count items for progress bar
-        item_count = [0]
+        # Sum total bytes for progress bar
+        total_bytes = [0]
         with h5py.File(h5_path, 'r') as h5tmp:
-            def counter(name, obj):
-                if isinstance(obj, h5py.Dataset) or (isinstance(obj, h5py.Group) and obj.attrs.get('empty_dir')):
-                    item_count[0] += 1
-            h5tmp.visititems(counter)
+            def size_counter(name, obj):
+                if isinstance(obj, h5py.Dataset):
+                    total_bytes[0] += obj.nbytes
+            h5tmp.visititems(size_counter)
 
-        progress = ProgressBar(item_count[0] if verbose else 0)
+        progress = ProgressBar(total_bytes[0] if verbose else 0)
         verbose_file = verbose and not progress.is_tty
 
         if parallel <= 1:
@@ -600,13 +612,13 @@ def extract_h5_to_directory(h5_path, extract_dir, file_key=None, parallel=1,
                             _restore_xattrs(dest_file_path, xattrs_raw)
                         if hdf5_attrs or xattrs_json:
                             all_metadata[name] = (hdf5_attrs, xattrs_json, xattrs_raw)
-                        progress.update(name)
+                        progress.update(name, len(file_bytes))
                         if verbose_file:
                             print(f"Extracted: {name}")
                     elif isinstance(obj, h5py.Group) and obj.attrs.get('empty_dir'):
                         dest_dir_path = os.path.join(extract_dir, name)
                         os.makedirs(dest_dir_path, exist_ok=True)
-                        progress.update(name)
+                        progress.update(name, 0)
                         if verbose_file:
                             print(f"Created empty dir: {name}")
                 h5fobj.visititems(extract_item)
@@ -637,7 +649,7 @@ def extract_h5_to_directory(h5_path, extract_dir, file_key=None, parallel=1,
                         hdf5_attrs, xattrs_json, xattrs_raw = _collect_user_metadata(obj)
                         if hdf5_attrs or xattrs_json:
                             all_metadata[name] = (hdf5_attrs, xattrs_json, xattrs_raw)
-                        progress.update(name)
+                        progress.update(name, len(file_bytes))
                     elif isinstance(obj, h5py.Group) and obj.attrs.get('empty_dir'):
                         empty_dir_names.append(name)
                 h5fobj.visititems(collector)
@@ -646,7 +658,7 @@ def extract_h5_to_directory(h5_path, extract_dir, file_key=None, parallel=1,
             for name in empty_dir_names:
                 dest_dir_path = os.path.join(extract_dir, name)
                 os.makedirs(dest_dir_path, exist_ok=True)
-                progress.update(name)
+                progress.update(name, 0)
                 if verbose_file:
                     print(f"Created empty dir: {name}")
 

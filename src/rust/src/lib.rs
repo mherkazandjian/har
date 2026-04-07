@@ -12,27 +12,39 @@ use walkdir::WalkDir;
 // Progress bar
 // ---------------------------------------------------------------------------
 
+fn human_size_bytes(nbytes: u64) -> String {
+    let units = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = nbytes as f64;
+    for unit in &units {
+        if size < 1024.0 {
+            return format!("{:.1} {}", size, unit);
+        }
+        size /= 1024.0;
+    }
+    format!("{:.1} PB", size)
+}
+
 pub struct Progress {
-    total: usize,
-    current: usize,
+    total: u64,
+    current: u64,
     recent: Vec<String>,
     prev_lines: usize,
     pub is_tty: bool,
 }
 
 impl Progress {
-    pub fn new(total: usize) -> Self {
+    pub fn new(total_bytes: u64) -> Self {
         Progress {
-            total,
+            total: total_bytes,
             current: 0,
             recent: Vec::new(),
             prev_lines: 0,
-            is_tty: io::stderr().is_terminal() && total > 0,
+            is_tty: io::stderr().is_terminal() && total_bytes > 0,
         }
     }
 
-    pub fn inc(&mut self, filename: &str) {
-        self.current += 1;
+    pub fn inc(&mut self, filename: &str, nbytes: u64) {
+        self.current += nbytes;
         self.recent.push(filename.to_string());
         if self.recent.len() > 5 {
             self.recent.remove(0);
@@ -48,19 +60,19 @@ impl Progress {
             write!(err, "\x1b[{}A", self.prev_lines).ok();
         }
 
-        let pct = self.current * 100 / self.total.max(1);
-        let bar_width = 40;
-        let filled = bar_width * self.current / self.total.max(1);
+        let pct = if self.total > 0 { self.current as f64 * 100.0 / self.total as f64 } else { 0.0 };
+        let bar_width: usize = 40;
+        let filled = if self.total > 0 { (bar_width as u64 * self.current / self.total) as usize } else { 0 };
         let empty = bar_width - filled;
 
         writeln!(
             err,
-            "\x1b[2K[{}{}] {}% ({}/{})",
+            "\x1b[2K[{}{}] {:.1}% ({} / {})",
             "█".repeat(filled),
             "░".repeat(empty),
             pct,
-            self.current,
-            self.total
+            human_size_bytes(self.current),
+            human_size_bytes(self.total)
         )
         .ok();
 
@@ -399,7 +411,10 @@ pub fn pack_or_append_to_h5(
             .unwrap_or_else(|e| panic!("Failed to create '{}': {}", output_h5, e))
     };
 
-    let mut progress = Progress::new(if verbose { file_entries.len() } else { 0 });
+    let total_size: u64 = file_entries.iter().map(|e| {
+        fs::metadata(&e.file_path).map(|m| m.len()).unwrap_or(0)
+    }).sum();
+    let mut progress = Progress::new(if verbose { total_size } else { 0 });
     let verbose_file = verbose && !progress.is_tty;
     let mut validation_errors: Vec<String> = Vec::new();
     let mut validated_count: usize = 0;
@@ -464,7 +479,7 @@ pub fn pack_or_append_to_h5(
                     }
                 }
             }
-            progress.inc(&entry.rel_path);
+            progress.inc(&entry.rel_path, fd.content.len() as u64);
         }
     } else {
         // Parallel path: read files in parallel, then write to HDF5 sequentially
@@ -518,7 +533,7 @@ pub fn pack_or_append_to_h5(
                     }
                 }
             }
-            progress.inc(&r.rel_path);
+            progress.inc(&r.rel_path, r.content.len() as u64);
         }
     }
     progress.finish();
@@ -688,8 +703,14 @@ pub fn extract_h5_to_directory(
         }
     } else {
         let items = collect_items(&h5f);
-        let total = items.iter().filter(|(_, t)| matches!(t, H5ObjType::Dataset | H5ObjType::EmptyDirGroup)).count();
-        let mut progress = Progress::new(if verbose { total } else { 0 });
+        let total_bytes: u64 = items.iter().filter_map(|(name, t)| {
+            if matches!(t, H5ObjType::Dataset) {
+                h5f.dataset(name).ok().map(|ds| ds.size() as u64)
+            } else {
+                None
+            }
+        }).sum();
+        let mut progress = Progress::new(if verbose { total_bytes } else { 0 });
         let verbose_file = verbose && !progress.is_tty;
 
         if parallel <= 1 {
@@ -717,7 +738,7 @@ pub fn extract_h5_to_directory(
                                 all_metadata.insert(name.clone(), meta);
                             }
                         }
-                        progress.inc(name);
+                        progress.inc(name, data.len() as u64);
                         if verbose_file {
                             println!("Extracted: {}", name);
                         }
@@ -725,7 +746,7 @@ pub fn extract_h5_to_directory(
                     H5ObjType::EmptyDirGroup => {
                         let dest = extract_path.join(name);
                         fs::create_dir_all(&dest).ok();
-                        progress.inc(name);
+                        progress.inc(name, 0);
                         if verbose_file {
                             println!("Created empty dir: {}", name);
                         }
@@ -753,8 +774,9 @@ pub fn extract_h5_to_directory(
                                 all_metadata.insert(name.clone(), meta);
                             }
                         }
+                        let data_len = data.len() as u64;
                         read_items.push((name.clone(), data, mode));
-                        progress.inc(name);
+                        progress.inc(name, data_len);
                     }
                     H5ObjType::EmptyDirGroup => {
                         empty_dir_names.push(name.clone());
@@ -766,7 +788,7 @@ pub fn extract_h5_to_directory(
             for name in &empty_dir_names {
                 let dest = extract_path.join(name);
                 fs::create_dir_all(&dest).ok();
-                progress.inc(name);
+                progress.inc(name, 0);
                 if verbose_file {
                     println!("Created empty dir: {}", name);
                 }

@@ -362,6 +362,7 @@ fn test_compression_roundtrip() {
         false,
         None,
         false,
+        false,
     );
 
     let extract_dir = base.join("out");
@@ -517,6 +518,7 @@ fn test_parallel_ingest_with_compression() {
         2,
         false,
         None,
+        false,
         false,
     );
 

@@ -21,16 +21,16 @@ import numpy as np
 
 
 class ProgressBar:
-    """Simple terminal progress bar with last-5-files display."""
-    def __init__(self, total):
-        self.total = total
+    """Simple terminal progress bar based on bytes processed."""
+    def __init__(self, total_bytes):
+        self.total = total_bytes
         self.current = 0
         self.recent = []
         self.prev_lines = 0
-        self.is_tty = sys.stderr.isatty() and total > 0
+        self.is_tty = sys.stderr.isatty() and total_bytes > 0
 
-    def update(self, filename):
-        self.current += 1
+    def update(self, filename, nbytes):
+        self.current += nbytes
         self.recent.append(filename)
         if len(self.recent) > 5:
             self.recent.pop(0)
@@ -40,11 +40,13 @@ class ProgressBar:
     def _render(self):
         if self.prev_lines > 0:
             sys.stderr.write(f'\x1b[{self.prev_lines}A')
-        pct = self.current * 100 // max(self.total, 1)
+        pct = self.current * 100.0 / max(self.total, 1)
         bar_width = 40
-        filled = bar_width * self.current // max(self.total, 1)
+        filled = int(bar_width * self.current / max(self.total, 1))
         empty = bar_width - filled
-        sys.stderr.write(f'\x1b[2K[{"█" * filled}{"░" * empty}] {pct}% ({self.current}/{self.total})\n')
+        cur_h = _human_size(self.current)
+        tot_h = _human_size(self.total)
+        sys.stderr.write(f'\x1b[2K[{"█" * filled}{"░" * empty}] {pct:.1f}% ({cur_h} / {tot_h})\n')
         for f in self.recent:
             sys.stderr.write(f'\x1b[2K  {f}\n')
         self.prev_lines = 1 + len(self.recent)
@@ -399,7 +401,8 @@ def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
         print(f"Inventory: {len(file_entries)} files, {len(empty_dirs)} empty dirs")
 
     # Phase 2: Read + checksum (parallelizable)
-    progress = ProgressBar(len(file_entries) if verbose else 0)
+    total_size = sum(os.path.getsize(fp) for fp, _ in file_entries)
+    progress = ProgressBar(total_size if verbose else 0)
     verbose_file = verbose and not progress.is_tty
 
     user_metadata_map = {}
@@ -418,7 +421,7 @@ def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
                     for name, value in xattrs.items():
                         xmap[name] = 'base64:' + base64.b64encode(value).decode('ascii')
                     user_metadata_map[rel_path] = {'xattrs': xmap}
-            progress.update(rel_path)
+            progress.update(rel_path, len(content))
             if verbose_file:
                 print(f"  Read: {rel_path}")
     else:
@@ -438,7 +441,7 @@ def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
                         for name, value in xattrs.items():
                             xmap[name] = 'base64:' + base64.b64encode(value).decode('ascii')
                         user_metadata_map[rel_path] = {'xattrs': xmap}
-                progress.update(rel_path)
+                progress.update(rel_path, len(content))
                 if verbose_file:
                     print(f"  Read: {rel_path}")
     progress.finish()
@@ -1111,7 +1114,8 @@ def extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
         errors = []
         batch_ids = sorted(by_batch.keys())
         file_count = len(index)
-        progress = ProgressBar(file_count if verbose else 0)
+        total_bytes = sum(int(rec['length']) for rec in index)
+        progress = ProgressBar(total_bytes if verbose else 0)
         verbose_file = verbose and not progress.is_tty
 
         def _extract_from_batch(batch_id, records, batch_data):
@@ -1146,7 +1150,7 @@ def extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
                     actual = _checksum_bytes(file_bytes, hash_algo)
                     if actual != sha256:
                         errors.append(out_path)
-                progress.update(out_path)
+                progress.update(out_path, length)
                 if verbose_file:
                     print(f"Extracted: {out_path}")
 
@@ -1182,8 +1186,8 @@ def extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
                                 out_path = path if bagit_raw else rel_key
                                 dest = os.path.join(extract_dir, out_path)
                                 _restore_xattrs_from_json(dest, xattrs)
-                for out_path, _, _, _ in work:
-                    progress.update(out_path)
+                for out_path, file_bytes, _, _ in work:
+                    progress.update(out_path, len(file_bytes))
                 if validate:
                     for rec in records:
                         offset = int(rec['offset'])

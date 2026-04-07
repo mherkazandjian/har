@@ -293,7 +293,10 @@ pub fn pack_bagit(
 
     // Phase 2: Read + checksum
     let hash_algo = checksum.unwrap_or("sha256");
-    let mut progress = crate::Progress::new(if verbose { sorted_entries.len() } else { 0 });
+    let total_size: u64 = sorted_entries.iter().map(|e| {
+        std::fs::metadata(&e.file_path).map(|m| m.len()).unwrap_or(0)
+    }).sum();
+    let mut progress = crate::Progress::new(if verbose { total_size } else { 0 });
     let verbose_file = verbose && !progress.is_tty;
 
     let mut user_metadata_map: std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>> =
@@ -318,7 +321,8 @@ pub fn pack_bagit(
                         user_metadata_map.insert(e.rel_path.clone(), entry);
                     }
                 }
-                progress.inc(&e.rel_path);
+                let content_len = hr.content.len() as u64;
+                progress.inc(&e.rel_path, content_len);
                 if verbose_file {
                     println!("  Read: {}", e.rel_path);
                 }
@@ -371,7 +375,7 @@ pub fn pack_bagit(
             }
         }
         for item in &items {
-            progress.inc(&item.bagit_path);
+            progress.inc(&item.bagit_path, item.content.len() as u64);
         }
         items
     };
@@ -756,7 +760,8 @@ pub fn extract_bagit(
     }
 
     let mut errors = Vec::new();
-    let mut progress = crate::Progress::new(if verbose { count } else { 0 });
+    let total_bytes: u64 = lengths.iter().take(count).sum();
+    let mut progress = crate::Progress::new(if verbose { total_bytes } else { 0 });
     let verbose_file = verbose && !progress.is_tty;
 
     for (bid, indices) in &by_batch {
@@ -792,7 +797,7 @@ pub fn extract_bagit(
                 if validate && crate::compute_checksum(file_bytes, &hash_algo) != shas[i] {
                     errors.push(out_path.to_string());
                 }
-                progress.inc(out_path);
+                progress.inc(out_path, len as u64);
                 if verbose_file { println!("Extracted: {}", out_path); }
             }
         } else {
@@ -832,7 +837,7 @@ pub fn extract_bagit(
             for &i in indices {
                 let path = paths[i];
                 let out_path = if bagit_raw { path } else { path.strip_prefix("data/").unwrap_or(path) };
-                progress.inc(out_path);
+                progress.inc(out_path, lengths[i]);
             }
         }
     }
