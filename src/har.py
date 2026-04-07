@@ -762,6 +762,12 @@ def main():
     parser.add_argument("--mpi", action="store_true",
                         help="Use MPI parallel HDF5 I/O (requires mpirun, mpi4py, parallel h5py).")
 
+    # Split mode.
+    parser.add_argument("--split", type=str, default=None,
+                        help="Split archive into multiple files (implies --bagit). "
+                             "SIZE: --split 100M (each split ~100MB, supports K/M/G). "
+                             "COUNT: --split n=4 (exactly 4 splits).")
+
     # Positional argument:
     # For -c and -r: one or more source directories or files.
     # For -x: optionally, the file key to extract (if omitted, extract entire archive).
@@ -775,6 +781,18 @@ def main():
     if args.parallel < 1:
         print("Error: --parallel must be >= 1.", file=sys.stderr)
         sys.exit(1)
+
+    # --split implies --bagit
+    if args.split:
+        if args.r:
+            print("Error: Append (-r) is not supported with --split.",
+                  file=sys.stderr)
+            sys.exit(1)
+        if args.mpi:
+            print("Error: --split and --mpi are mutually exclusive.",
+                  file=sys.stderr)
+            sys.exit(1)
+        args.bagit = True
 
     h5_file = args.file
     target_dir = args.directory  # For extraction, the target directory.
@@ -819,7 +837,10 @@ def main():
 
     # --- BagIt mode dispatch ---
     if args.bagit or args.mpi:
-        from har_bagit import pack_bagit, extract_bagit, list_bagit, parse_batch_size
+        from har_bagit import (pack_bagit, extract_bagit, list_bagit,
+                               parse_batch_size, parse_split_arg,
+                               pack_bagit_split, is_split_archive,
+                               extract_bagit_split, list_bagit_split)
 
         if args.mpi:
             from har_mpi import mpi_pack_bagit, mpi_extract_bagit, mpi_list_bagit
@@ -859,17 +880,32 @@ def main():
                 print("Error: At least one source is required for archive creation (-c).",
                       file=sys.stderr)
                 sys.exit(1)
-            pack_bagit(
-                sources, h5_file,
-                compression=compression,
-                compression_opts=compression_opts,
-                shuffle=args.shuffle,
-                batch_size=bs,
-                parallel=args.parallel,
-                verbose=args.verbose,
-                checksum=args.checksum,
-                xattr_flag=args.xattr,
-                validate=args.validate)
+            if args.split:
+                split_spec = parse_split_arg(args.split)
+                pack_bagit_split(
+                    sources, h5_file,
+                    compression=compression,
+                    compression_opts=compression_opts,
+                    shuffle=args.shuffle,
+                    batch_size=bs,
+                    parallel=args.parallel,
+                    verbose=args.verbose,
+                    checksum=args.checksum,
+                    xattr_flag=args.xattr,
+                    validate=args.validate,
+                    split_spec=split_spec)
+            else:
+                pack_bagit(
+                    sources, h5_file,
+                    compression=compression,
+                    compression_opts=compression_opts,
+                    shuffle=args.shuffle,
+                    batch_size=bs,
+                    parallel=args.parallel,
+                    verbose=args.verbose,
+                    checksum=args.checksum,
+                    xattr_flag=args.xattr,
+                    validate=args.validate)
             validation_ok = True
             if args.validate_roundtrip:
                 validation_ok = validate_roundtrip(
@@ -886,25 +922,57 @@ def main():
                           file=sys.stderr)
         elif args.x:
             file_key = sources[0] if sources else None
-            extract_bagit(
-                h5_file, target_dir,
-                file_key=file_key,
-                validate=args.validate,
-                bagit_raw=args.bagit_raw,
-                parallel=args.parallel,
-                verbose=args.verbose,
-                metadata_json=args.metadata_json,
-                xattr_flag=args.xattr)
+            # Auto-detect split archive
+            if is_split_archive(h5_file):
+                extract_bagit_split(
+                    h5_file, target_dir,
+                    file_key=file_key,
+                    validate=args.validate,
+                    bagit_raw=args.bagit_raw,
+                    parallel=args.parallel,
+                    verbose=args.verbose,
+                    metadata_json=args.metadata_json,
+                    xattr_flag=args.xattr)
+            else:
+                extract_bagit(
+                    h5_file, target_dir,
+                    file_key=file_key,
+                    validate=args.validate,
+                    bagit_raw=args.bagit_raw,
+                    parallel=args.parallel,
+                    verbose=args.verbose,
+                    metadata_json=args.metadata_json,
+                    xattr_flag=args.xattr)
         elif args.t:
-            list_bagit(h5_file, bagit_raw=args.bagit_raw)
+            if is_split_archive(h5_file):
+                list_bagit_split(h5_file, bagit_raw=args.bagit_raw)
+            else:
+                list_bagit(h5_file, bagit_raw=args.bagit_raw)
         else:
             parser.print_help()
             sys.exit(1)
 
     # --- Auto-detect bagit format on extract/list ---
     elif (args.x or args.t) and os.path.exists(os.path.expanduser(h5_file)):
-        from har_bagit import is_bagit_archive, extract_bagit, list_bagit
-        if is_bagit_archive(h5_file):
+        from har_bagit import (is_bagit_archive, is_split_archive,
+                               extract_bagit, list_bagit,
+                               extract_bagit_split, list_bagit_split)
+        if is_split_archive(h5_file):
+            print("Note: detected split bagit archive.", file=sys.stderr)
+            if args.x:
+                file_key = sources[0] if sources else None
+                extract_bagit_split(
+                    h5_file, target_dir,
+                    file_key=file_key,
+                    validate=args.validate,
+                    bagit_raw=getattr(args, 'bagit_raw', False),
+                    parallel=args.parallel,
+                    verbose=args.verbose,
+                    metadata_json=getattr(args, 'metadata_json', False),
+                    xattr_flag=getattr(args, 'xattr', False))
+            else:
+                list_bagit_split(h5_file, bagit_raw=getattr(args, 'bagit_raw', False))
+        elif is_bagit_archive(h5_file):
             print("Note: detected bagit-v1 archive, using BagIt extraction.",
                   file=sys.stderr)
             if args.x:

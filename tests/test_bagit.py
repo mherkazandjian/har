@@ -8,7 +8,10 @@ import pytest
 
 from har_bagit import (
     pack_bagit, extract_bagit, list_bagit, build_inventory,
-    is_bagit_archive, parse_batch_size, HAR_FORMAT_VALUE, INDEX_DTYPE,
+    is_bagit_archive, is_split_archive, parse_batch_size, parse_split_arg,
+    split_filename, distribute_files, pack_bagit_split,
+    extract_bagit_split, list_bagit_split,
+    HAR_FORMAT_VALUE, INDEX_DTYPE,
 )
 from har import validate_roundtrip, delete_source_files
 
@@ -604,3 +607,246 @@ def test_delete_source_after_bagit_validate():
 
         delete_source_files([src])
         assert not os.path.exists(src)
+
+
+# ---------------------------------------------------------------------------
+# Split helper tests
+# ---------------------------------------------------------------------------
+
+def test_parse_split_arg_size():
+    assert parse_split_arg("100M") == {'mode': 'size', 'size': 100 * 1024 * 1024}
+    assert parse_split_arg("2G") == {'mode': 'size', 'size': 2 * 1024 * 1024 * 1024}
+    assert parse_split_arg("512K") == {'mode': 'size', 'size': 512 * 1024}
+    assert parse_split_arg("size=64M") == {'mode': 'size', 'size': 64 * 1024 * 1024}
+
+
+def test_parse_split_arg_count():
+    assert parse_split_arg("n=4") == {'mode': 'count', 'count': 4}
+    assert parse_split_arg("n=100") == {'mode': 'count', 'count': 100}
+
+
+def test_split_filename_fn():
+    assert split_filename("archive.h5", 0, 4) == "archive.h5"
+    assert split_filename("archive.h5", 1, 4) == "archive.001.h5"
+    assert split_filename("archive.h5", 3, 4) == "archive.003.h5"
+    assert split_filename("archive.h5", 99, 100) == "archive.099.h5"
+    assert split_filename("/tmp/test.h5", 0, 2) == "/tmp/test.h5"
+    assert split_filename("/tmp/test.h5", 1, 2) == "/tmp/test.001.h5"
+
+
+def test_distribute_files_balance():
+    entries = [("a", "a", 100), ("b", "b", 200), ("c", "c", 50), ("d", "d", 150)]
+    result = distribute_files(entries, 2)
+    assert len(result) == 2
+    # All files distributed
+    total = sum(len(r) for r in result)
+    assert total == 4
+    # Sizes should be roughly balanced
+    sizes = [sum(s for _, _, s in r) for r in result]
+    assert abs(sizes[0] - sizes[1]) <= 200
+
+
+def test_distribute_files_single():
+    entries = [("a", "a", 100)]
+    result = distribute_files(entries, 3)
+    total = sum(len(r) for r in result)
+    assert total == 1
+
+
+# ---------------------------------------------------------------------------
+# Split archive tests
+# ---------------------------------------------------------------------------
+
+def test_split_basic_roundtrip():
+    """Create split archive (count-based), extract, verify."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "src")
+        os.makedirs(src)
+        _make_test_tree(src, n_dirs=4, n_files_per_dir=5)
+
+        archive = os.path.join(tmp, "archive.h5")
+        split_spec = {'mode': 'count', 'count': 3}
+        pack_bagit_split([src], archive, split_spec=split_spec)
+
+        # Verify split files exist
+        assert os.path.exists(archive)
+        assert os.path.exists(os.path.join(tmp, "archive.001.h5"))
+        assert os.path.exists(os.path.join(tmp, "archive.002.h5"))
+
+        # Verify split attributes
+        assert is_split_archive(archive)
+
+        # Verify split_manifest exists in file 0
+        with h5py.File(archive, 'r') as h5f:
+            assert 'split_manifest' in h5f
+            count = h5f['split_manifest'].attrs['count']
+            assert count == 20  # 4 dirs * 5 files
+
+        # Extract
+        out = os.path.join(tmp, "out")
+        os.makedirs(out)
+        extract_bagit_split(archive, out)
+
+        # Verify all files
+        for i in range(4):
+            for j in range(5):
+                p = os.path.join(out, "src", f"dir{i}", f"file{j}.txt")
+                assert os.path.exists(p), f"Missing: {p}"
+                assert open(p).read() == f"content dir{i}/file{j}"
+
+
+def test_split_size_based():
+    """Create split archive (size-based), verify correct splitting."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "src")
+        os.makedirs(src)
+        for i in range(10):
+            with open(os.path.join(src, f"file{i}.txt"), "w") as f:
+                f.write("x" * 200)
+
+        archive = os.path.join(tmp, "archive.h5")
+        split_spec = {'mode': 'size', 'size': 500}
+        pack_bagit_split([src], archive, split_spec=split_spec)
+
+        assert is_split_archive(archive)
+
+        out = os.path.join(tmp, "out")
+        os.makedirs(out)
+        extract_bagit_split(archive, out)
+
+        for i in range(10):
+            p = os.path.join(out, "src", f"file{i}.txt")
+            assert open(p).read() == "x" * 200
+
+
+def test_split_single_file_extract():
+    """Extract one file from a split archive."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "src")
+        os.makedirs(src)
+        with open(os.path.join(src, "a.txt"), "w") as f:
+            f.write("AAA")
+        with open(os.path.join(src, "b.txt"), "w") as f:
+            f.write("BBB")
+
+        archive = os.path.join(tmp, "archive.h5")
+        split_spec = {'mode': 'count', 'count': 2}
+        pack_bagit_split([src], archive, split_spec=split_spec)
+
+        out = os.path.join(tmp, "out")
+        os.makedirs(out)
+        extract_bagit_split(archive, out, file_key="src/a.txt")
+
+        assert os.path.exists(os.path.join(out, "src", "a.txt"))
+        assert open(os.path.join(out, "src", "a.txt")).read() == "AAA"
+
+
+def test_split_one_is_normal():
+    """--split n=1 creates a normal archive with no split attributes."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "src")
+        os.makedirs(src)
+        with open(os.path.join(src, "f.txt"), "w") as f:
+            f.write("data")
+
+        archive = os.path.join(tmp, "archive.h5")
+        split_spec = {'mode': 'count', 'count': 1}
+        pack_bagit_split([src], archive, split_spec=split_spec)
+
+        assert is_bagit_archive(archive)
+
+        out = os.path.join(tmp, "out")
+        os.makedirs(out)
+        extract_bagit(archive, out)
+        assert open(os.path.join(out, "src", "f.txt")).read() == "data"
+
+
+def test_split_parallel_roundtrip():
+    """Split with parallel threads."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "src")
+        os.makedirs(src)
+        _make_test_tree(src, n_dirs=5, n_files_per_dir=10)
+
+        archive = os.path.join(tmp, "archive.h5")
+        split_spec = {'mode': 'count', 'count': 4}
+        pack_bagit_split([src], archive, parallel=4, split_spec=split_spec)
+
+        out = os.path.join(tmp, "out")
+        os.makedirs(out)
+        extract_bagit_split(archive, out, parallel=4)
+
+        count = _count_files(os.path.join(out, "src"))
+        assert count == 50
+
+
+def test_split_with_compression():
+    """Split with gzip compression."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "comp")
+        os.makedirs(src)
+        with open(os.path.join(src, "big.txt"), "w") as f:
+            f.write("A" * 100000)
+
+        archive = os.path.join(tmp, "archive.h5")
+        split_spec = {'mode': 'count', 'count': 2}
+        pack_bagit_split([src], archive, compression='gzip',
+                         compression_opts=9, split_spec=split_spec)
+
+        out = os.path.join(tmp, "out")
+        os.makedirs(out)
+        extract_bagit_split(archive, out)
+
+        assert open(os.path.join(out, "comp", "big.txt")).read() == "A" * 100000
+
+
+def test_split_with_validation():
+    """Split with --validate."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "src")
+        os.makedirs(src)
+        _make_test_tree(src)
+
+        archive = os.path.join(tmp, "archive.h5")
+        split_spec = {'mode': 'count', 'count': 2}
+        pack_bagit_split([src], archive, validate=True, split_spec=split_spec)
+
+        out = os.path.join(tmp, "out")
+        os.makedirs(out)
+        extract_bagit_split(archive, out, validate=True)
+
+
+def test_split_empty_dirs():
+    """Empty directories preserved in split archive."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "proj")
+        os.makedirs(os.path.join(src, "empty_sub"))
+        os.makedirs(os.path.join(src, "full"))
+        with open(os.path.join(src, "full", "f.txt"), "w") as f:
+            f.write("data")
+
+        archive = os.path.join(tmp, "archive.h5")
+        split_spec = {'mode': 'count', 'count': 2}
+        pack_bagit_split([src], archive, split_spec=split_spec)
+
+        out = os.path.join(tmp, "out")
+        os.makedirs(out)
+        extract_bagit_split(archive, out)
+
+        assert os.path.isdir(os.path.join(out, "proj", "empty_sub"))
+        assert os.path.isfile(os.path.join(out, "proj", "full", "f.txt"))
+
+
+def test_split_list():
+    """list_bagit_split lists all files from all splits."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "src")
+        os.makedirs(src)
+        _make_test_tree(src, n_dirs=2, n_files_per_dir=3)
+
+        archive = os.path.join(tmp, "archive.h5")
+        split_spec = {'mode': 'count', 'count': 2}
+        pack_bagit_split([src], archive, split_spec=split_spec)
+
+        # Just verify it runs without error
+        list_bagit_split(archive)

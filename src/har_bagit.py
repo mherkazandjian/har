@@ -186,6 +186,112 @@ def is_bagit_archive(h5_path):
         return False
 
 
+def is_split_archive(h5_path):
+    """Check if an HDF5 file is a split bagit archive."""
+    try:
+        with h5py.File(h5_path, 'r') as h5f:
+            return h5f.attrs.get('har_split_count', 0) > 1
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Split helpers
+# ---------------------------------------------------------------------------
+
+def parse_split_arg(value):
+    """Parse --split argument.
+
+    '100M' or 'size=100M' → {'mode': 'size', 'size': 104857600}
+    'n=4'                 → {'mode': 'count', 'count': 4}
+    """
+    value = value.strip()
+    if value.startswith('n='):
+        n = int(value[2:])
+        if n < 1:
+            print("Error: --split count must be >= 1.", file=sys.stderr)
+            sys.exit(1)
+        return {'mode': 'count', 'count': n}
+    if value.startswith('size='):
+        value = value[5:]
+    sz = parse_batch_size(value)
+    if sz <= 0:
+        print("Error: --split size must be > 0.", file=sys.stderr)
+        sys.exit(1)
+    return {'mode': 'size', 'size': sz}
+
+
+def split_filename(base, index, total):
+    """Generate filename for split index. Split 0 = base name."""
+    if index == 0:
+        return base
+    width = max(3, len(str(total - 1)))
+    stem, ext = os.path.splitext(base)
+    return f"{stem}.{str(index).zfill(width)}{ext}"
+
+
+def distribute_files(sized_entries, n_splits):
+    """Bin-pack file entries into n_splits balanced groups.
+
+    sized_entries: list of (abs_path, rel_path, size)
+    Returns list of n_splits lists, each containing (abs_path, rel_path, size).
+    Uses first-fit-decreasing by file size.
+    """
+    import heapq
+    if n_splits <= 1:
+        return [sized_entries]
+    # Sort by size descending
+    sorted_items = sorted(sized_entries, key=lambda x: x[2], reverse=True)
+    # Min-heap of (current_total_size, split_index)
+    heap = [(0, i) for i in range(n_splits)]
+    heapq.heapify(heap)
+    assignments = [[] for _ in range(n_splits)]
+    for entry in sorted_items:
+        total, idx = heapq.heappop(heap)
+        assignments[idx].append(entry)
+        heapq.heappush(heap, (total + entry[2], idx))
+    return assignments
+
+
+def _assign_batches_streaming(file_entries, batch_size):
+    """Assign files to batches based on file size, without reading content.
+
+    file_entries: list of (abs_path, rel_path, size)
+
+    Returns list of batch dicts:
+      [{'id': int,
+        'files': [(abs_path, rel_path, size, offset_in_batch), ...],
+        'total_bytes': int}, ...]
+    """
+    batches = []
+    current_files = []
+    current_bytes = 0
+    batch_id = 0
+
+    for abs_path, rel_path, fsize in file_entries:
+        if current_bytes + fsize > batch_size and current_files:
+            batches.append({
+                'id': batch_id,
+                'files': current_files,
+                'total_bytes': current_bytes,
+            })
+            batch_id += 1
+            current_files = []
+            current_bytes = 0
+
+        current_files.append((abs_path, rel_path, fsize, current_bytes))
+        current_bytes += fsize
+
+    if current_files:
+        batches.append({
+            'id': batch_id,
+            'files': current_files,
+            'total_bytes': current_bytes,
+        })
+
+    return batches
+
+
 # ---------------------------------------------------------------------------
 # Batching
 # ---------------------------------------------------------------------------
@@ -462,6 +568,434 @@ def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
             sys.exit(1)
         else:
             print(f"Validation passed. {file_count} files verified.")
+
+
+# ---------------------------------------------------------------------------
+# Split pack
+# ---------------------------------------------------------------------------
+
+def _pack_single_split(split_index, file_entries, output_path, split_count,
+                       base_name, compression, compression_opts, shuffle,
+                       batch_size, hash_algo, xattr_flag, validate, verbose,
+                       empty_dirs):
+    """Pack one split file. Self-contained, thread-safe, streaming.
+
+    file_entries: list of (abs_path, rel_path, size) — NO content.
+    Reads files from disk on demand, one batch at a time.
+    Returns list of (bagit_path, split_index, sha256_hex) for global manifest.
+    """
+    # Assign batches by size (no content needed)
+    batches = _assign_batches_streaming(file_entries, batch_size)
+
+    # Streaming: process each batch, collect index records + manifest entries
+    index_records = []   # for HDF5 index dataset
+    manifest_entries = []  # for global split_manifest + BagIt manifest
+    user_metadata_map = {}
+
+    with h5py.File(output_path, 'w') as h5f:
+        # Root attributes
+        h5f.attrs[HAR_FORMAT_ATTR] = HAR_FORMAT_VALUE
+        h5f.attrs[HAR_VERSION_ATTR] = HAR_VERSION_VALUE
+        h5f.attrs['har_checksum_algo'] = hash_algo
+        h5f.attrs['har_split_count'] = np.uint32(split_count)
+        h5f.attrs['har_split_index'] = np.uint32(split_index)
+        h5f.attrs['har_split_base'] = base_name
+
+        batches_grp = h5f.create_group('batches')
+
+        for batch in batches:
+            # Read this batch's files from disk (streaming — only one batch in RAM)
+            batch_buffer = bytearray(batch['total_bytes'])
+            batch_file_records = []
+
+            for abs_path, rel_path, fsize, offset in batch['files']:
+                bagit_path = "data/" + rel_path
+                content, mode, hash_hex, uid, gid, mtime, owner, group_name = \
+                    _read_and_hash(abs_path, hash_algo)
+
+                batch_buffer[offset:offset + len(content)] = content
+
+                batch_file_records.append({
+                    'bagit_path': bagit_path,
+                    'batch_id': batch['id'],
+                    'offset': offset,
+                    'length': len(content),
+                    'mode': mode,
+                    'sha256': hash_hex,
+                    'uid': uid, 'gid': gid, 'mtime': mtime,
+                    'owner': owner, 'group_name': group_name,
+                })
+                manifest_entries.append((bagit_path, split_index, hash_hex))
+
+                if xattr_flag:
+                    from har import _read_xattrs
+                    xattrs = _read_xattrs(abs_path)
+                    if xattrs:
+                        xmap = {}
+                        for name, value in xattrs.items():
+                            xmap[name] = 'base64:' + base64.b64encode(value).decode('ascii')
+                        user_metadata_map[rel_path] = {'xattrs': xmap}
+
+            index_records.extend(batch_file_records)
+
+            # Write batch dataset
+            ds_kwargs = {}
+            if compression:
+                ds_kwargs['compression'] = compression
+                ds_kwargs['compression_opts'] = compression_opts
+                ds_kwargs['shuffle'] = shuffle
+            batches_grp.create_dataset(
+                str(batch['id']),
+                data=np.frombuffer(bytes(batch_buffer), dtype=np.uint8),
+                dtype=np.uint8,
+                **ds_kwargs,
+            )
+            # Free batch buffer
+            del batch_buffer
+
+            if verbose:
+                print(f"  [Split {split_index}] Wrote batch {batch['id']}: "
+                      f"{len(batch['files'])} files, {_human_size(batch['total_bytes'])}")
+
+        # Write index dataset
+        file_count = len(index_records)
+        index_arr = np.zeros(file_count, dtype=INDEX_DTYPE)
+        for i, rec in enumerate(index_records):
+            index_arr[i]['path'] = rec['bagit_path'].encode('utf-8')
+            index_arr[i]['batch_id'] = rec['batch_id']
+            index_arr[i]['offset'] = rec['offset']
+            index_arr[i]['length'] = rec['length']
+            index_arr[i]['mode'] = rec['mode']
+            index_arr[i]['sha256'] = rec['sha256'].encode('ascii')
+            index_arr[i]['uid'] = rec['uid']
+            index_arr[i]['gid'] = rec['gid']
+            index_arr[i]['mtime'] = rec['mtime']
+            index_arr[i]['owner'] = rec['owner'].encode('utf-8')
+            index_arr[i]['group_name'] = rec['group_name'].encode('utf-8')
+
+        if file_count > 0:
+            h5f.create_dataset('index', data=index_arr, compression='gzip',
+                               compression_opts=9)
+        else:
+            h5f.create_dataset('index', data=index_arr)
+
+        # BagIt tag files (per-split)
+        total_bytes = sum(rec['length'] for rec in index_records)
+        per_split_manifest_records = [(rec['bagit_path'], rec['sha256'])
+                                      for rec in index_records]
+        manifest_name = f'manifest-{hash_algo}.txt'
+        tagmanifest_name = f'tagmanifest-{hash_algo}.txt'
+        bagit_txt = _generate_bagit_txt()
+        bag_info_txt = _generate_bag_info(total_bytes, file_count)
+        manifest_txt = _generate_manifest(per_split_manifest_records)
+        tagmanifest_txt = _generate_tagmanifest({
+            'bagit.txt': bagit_txt,
+            'bag-info.txt': bag_info_txt,
+            manifest_name: manifest_txt,
+        }, hash_algo)
+
+        bagit_grp = h5f.create_group('bagit')
+        for name, content in [('bagit.txt', bagit_txt),
+                              ('bag-info.txt', bag_info_txt),
+                              (manifest_name, manifest_txt),
+                              (tagmanifest_name, tagmanifest_txt)]:
+            bagit_grp.create_dataset(
+                name, data=np.frombuffer(content, dtype=np.uint8), dtype=np.uint8)
+
+        # Empty directories
+        if empty_dirs:
+            bagit_empty = ["data/" + d for d in empty_dirs]
+            max_len = max(len(d) for d in bagit_empty)
+            dt = f'S{max_len + 1}'
+            h5f.create_dataset(
+                'empty_dirs',
+                data=np.array([d.encode('utf-8') for d in bagit_empty], dtype=dt))
+
+        # User metadata (xattrs)
+        if user_metadata_map:
+            json_blob = json.dumps(user_metadata_map, indent=2, sort_keys=True).encode('utf-8')
+            h5f.create_dataset('user_metadata',
+                               data=np.frombuffer(json_blob, dtype=np.uint8),
+                               dtype=np.uint8)
+
+    # Optional validation
+    if validate:
+        errors = []
+        with h5py.File(output_path, 'r') as h5v:
+            v_index = h5v['index'][()]
+            for rec in v_index:
+                batch_id = int(rec['batch_id'])
+                offset = int(rec['offset'])
+                length = int(rec['length'])
+                stored_sha = rec['sha256'].decode('ascii')
+                path = rec['path'].decode('utf-8')
+                batch_data = h5v[f'batches/{batch_id}'][()]
+                file_bytes = batch_data[offset:offset + length].tobytes()
+                actual = _checksum_bytes(file_bytes, hash_algo)
+                if actual != stored_sha:
+                    errors.append(path)
+        if errors:
+            print(f"VALIDATION FAILED on split {split_index}, {len(errors)} file(s):",
+                  file=sys.stderr)
+            for e in errors[:10]:
+                print(f"  {e}", file=sys.stderr)
+            return None  # Signal failure
+        elif file_count > 0:
+            print(f"  [Split {split_index}] Validation passed. {file_count} files verified.")
+
+    return manifest_entries
+
+
+def _write_split_manifest(h5_path, manifest_entries, split_count):
+    """Write global split_manifest group into the 0th split file."""
+    with h5py.File(h5_path, 'a') as h5f:
+        grp = h5f.create_group('split_manifest')
+        count = len(manifest_entries)
+        grp.attrs['count'] = np.uint64(count)
+
+        paths_blob = "\n".join(e[0] for e in manifest_entries).encode('utf-8')
+        grp.create_dataset('paths',
+                           data=np.frombuffer(paths_blob, dtype=np.uint8),
+                           dtype=np.uint8)
+
+        split_ids = np.array([e[1] for e in manifest_entries], dtype=np.uint32)
+        grp.create_dataset('split_ids', data=split_ids)
+
+        sha256s_blob = "\n".join(e[2] for e in manifest_entries).encode('utf-8')
+        grp.create_dataset('sha256s',
+                           data=np.frombuffer(sha256s_blob, dtype=np.uint8),
+                           dtype=np.uint8)
+
+
+def pack_bagit_split(sources, output_h5, compression=None, compression_opts=None,
+                     shuffle=False, batch_size=DEFAULT_BATCH_SIZE, parallel=1,
+                     verbose=False, checksum=None, xattr_flag=False,
+                     validate=False, split_spec=None):
+    """Create a split BagIt archive. Orchestrates the full workflow."""
+    output_h5 = os.path.expanduser(output_h5)
+    t0 = time.time()
+    hash_algo = checksum or 'sha256'
+    base_name = os.path.basename(output_h5)
+
+    # Phase 1: Inventory (paths + sizes only, no content)
+    file_entries, empty_dirs = build_inventory(sources)
+    if not file_entries:
+        print("Error: no files to archive.", file=sys.stderr)
+        sys.exit(1)
+
+    sized_entries = [(fp, rp, os.path.getsize(fp)) for fp, rp in file_entries]
+    total_size = sum(s for _, _, s in sized_entries)
+
+    if verbose:
+        print(f"Inventory: {len(sized_entries)} files, {_human_size(total_size)}, "
+              f"{len(empty_dirs)} empty dirs")
+
+    # Phase 2: Resolve split count
+    if split_spec['mode'] == 'count':
+        split_count = split_spec['count']
+    else:
+        split_count = max(1, -(-total_size // split_spec['size']))  # ceil division
+
+    split_count = max(1, min(split_count, len(sized_entries)))
+    if verbose:
+        print(f"Splitting into {split_count} files")
+
+    # Phase 3: Distribute files across splits
+    split_assignments = distribute_files(sized_entries, split_count)
+
+    # Generate split filenames
+    split_paths = [split_filename(output_h5, i, split_count)
+                   for i in range(split_count)]
+
+    if verbose:
+        for i, (path, entries) in enumerate(zip(split_paths, split_assignments)):
+            split_size = sum(s for _, _, s in entries)
+            print(f"  Split {i}: {len(entries)} files, {_human_size(split_size)} -> {os.path.basename(path)}")
+
+    # Phase 4: Pack splits (parallel)
+    effective_parallel = min(parallel, split_count)
+
+    def _pack_split(idx):
+        return _pack_single_split(
+            split_index=idx,
+            file_entries=split_assignments[idx],
+            output_path=split_paths[idx],
+            split_count=split_count,
+            base_name=base_name,
+            compression=compression,
+            compression_opts=compression_opts,
+            shuffle=shuffle,
+            batch_size=batch_size,
+            hash_algo=hash_algo,
+            xattr_flag=xattr_flag,
+            validate=validate,
+            verbose=verbose,
+            empty_dirs=empty_dirs if idx == 0 else [],
+        )
+
+    all_manifest_entries = []
+    failed = False
+
+    if effective_parallel <= 1:
+        for i in range(split_count):
+            result = _pack_split(i)
+            if result is None:
+                failed = True
+            else:
+                all_manifest_entries.extend(result)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_parallel) as executor:
+            futures = {executor.submit(_pack_split, i): i for i in range(split_count)}
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if result is None:
+                    failed = True
+                else:
+                    all_manifest_entries.extend(result)
+
+    if failed:
+        print("VALIDATION FAILED on one or more split files.", file=sys.stderr)
+        sys.exit(1)
+
+    # Phase 5: Write global manifest to split 0
+    _write_split_manifest(split_paths[0], all_manifest_entries, split_count)
+
+    t1 = time.time()
+    print(f"\nOperation completed in {t1 - t0:.2f} seconds.")
+    print(f"  {len(all_manifest_entries)} files across {split_count} splits, "
+          f"{_human_size(total_size)} payload")
+    for p in split_paths:
+        print(f"  {os.path.basename(p)}: {_human_size(os.path.getsize(p))}")
+
+
+# ---------------------------------------------------------------------------
+# Split extract
+# ---------------------------------------------------------------------------
+
+def _extract_single_split(split_path, extract_dir, validate, bagit_raw,
+                          verbose, metadata_json, xattr_flag):
+    """Extract all files from one split. Thread-safe. Returns error list."""
+    try:
+        extract_bagit(split_path, extract_dir, file_key=None,
+                      validate=validate, bagit_raw=bagit_raw,
+                      parallel=1, verbose=verbose,
+                      metadata_json=metadata_json, xattr_flag=xattr_flag)
+        return []
+    except SystemExit:
+        return [split_path]
+
+
+def extract_bagit_split(h5_path, extract_dir, file_key=None, validate=False,
+                        bagit_raw=False, parallel=1, verbose=False,
+                        metadata_json=False, xattr_flag=False):
+    """Extract from a split archive."""
+    h5_path = os.path.expanduser(h5_path)
+    extract_dir = os.path.expanduser(extract_dir)
+
+    with h5py.File(h5_path, 'r') as h5f:
+        split_count = int(h5f.attrs.get('har_split_count', 1))
+        base_name = h5f.attrs.get('har_split_base', os.path.basename(h5_path))
+        if isinstance(base_name, bytes):
+            base_name = base_name.decode('utf-8')
+
+    base_dir = os.path.dirname(os.path.abspath(h5_path))
+
+    # Resolve all split file paths
+    split_paths = []
+    for i in range(split_count):
+        sp = os.path.join(base_dir, split_filename(base_name, i, split_count))
+        if not os.path.exists(sp):
+            print(f"Error: split file '{sp}' not found. Archive may be incomplete.",
+                  file=sys.stderr)
+            sys.exit(1)
+        split_paths.append(sp)
+
+    # Single-file extraction: look up in split_manifest
+    if file_key is not None:
+        with h5py.File(h5_path, 'r') as h5f:
+            if 'split_manifest' not in h5f:
+                print("Error: split_manifest not found in primary archive.",
+                      file=sys.stderr)
+                sys.exit(1)
+            sm = h5f['split_manifest']
+            paths = sm['paths'][()].tobytes().decode('utf-8').split('\n')
+            split_ids = sm['split_ids'][()]
+
+            # Normalize file_key for lookup
+            lookup = file_key
+            lookup_data = "data/" + file_key
+
+            target_split = None
+            for j, p in enumerate(paths):
+                # Match against both with and without data/ prefix
+                p_stripped = p[5:] if p.startswith('data/') else p
+                if p_stripped == lookup or p == lookup_data:
+                    target_split = int(split_ids[j])
+                    break
+
+            if target_split is None:
+                print(f"Error: '{file_key}' not found in split archive.",
+                      file=sys.stderr)
+                sys.exit(1)
+
+        # Extract from the target split
+        extract_bagit(split_paths[target_split], extract_dir,
+                      file_key=file_key, validate=validate,
+                      bagit_raw=bagit_raw, parallel=1, verbose=verbose,
+                      metadata_json=metadata_json, xattr_flag=xattr_flag)
+        return
+
+    # Full extraction: process each split in parallel
+    effective_parallel = min(parallel, split_count)
+    errors = []
+
+    if effective_parallel <= 1:
+        for sp in split_paths:
+            errs = _extract_single_split(sp, extract_dir, validate, bagit_raw,
+                                         verbose, metadata_json, xattr_flag)
+            errors.extend(errs)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_parallel) as executor:
+            futures = [executor.submit(_extract_single_split, sp, extract_dir,
+                                       validate, bagit_raw, verbose,
+                                       metadata_json, xattr_flag)
+                       for sp in split_paths]
+            for future in concurrent.futures.as_completed(futures):
+                errors.extend(future.result())
+
+    if errors:
+        print(f"Extraction failed on {len(errors)} split file(s):", file=sys.stderr)
+        for e in errors:
+            print(f"  {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def list_bagit_split(h5_path, bagit_raw=False):
+    """List contents of a split archive from the global manifest."""
+    h5_path = os.path.expanduser(h5_path)
+    with h5py.File(h5_path, 'r') as h5f:
+        split_count = int(h5f.attrs.get('har_split_count', 1))
+
+        if 'split_manifest' not in h5f:
+            print("Error: split_manifest not found.", file=sys.stderr)
+            sys.exit(1)
+
+        sm = h5f['split_manifest']
+        paths = sm['paths'][()].tobytes().decode('utf-8').split('\n')
+
+        for p in sorted(paths):
+            if not p:
+                continue
+            if bagit_raw:
+                print(p)
+            else:
+                # Strip data/ prefix
+                if p.startswith('data/'):
+                    print(p[5:])
+                else:
+                    print(p)
+
+    print(f"\n{len(paths)} entries across {split_count} splits")
 
 
 # ---------------------------------------------------------------------------
