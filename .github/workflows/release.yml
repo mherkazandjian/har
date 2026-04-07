@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-static:
+    name: Build static musl binary
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.86-alpine
+    steps:
+      - name: Install build dependencies
+        run: apk add --no-cache bash git hdf5-dev hdf5-static musl-dev pkgconf cmake make perl zlib-static
+
+      - uses: actions/checkout@v4
+
+      - name: Add musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/rust/target
+          key: musl-cargo-${{ hashFiles('src/rust/Cargo.lock') }}
+          restore-keys: musl-cargo-
+
+      - name: Build static binary
+        working-directory: src/rust
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cargo build --features static-hdf5 --release --target x86_64-unknown-linux-musl
+
+      - name: Run tests
+        working-directory: src/rust
+        run: cargo test --features static-hdf5 --target x86_64-unknown-linux-musl
+
+      - name: Verify binary
+        run: |
+          file src/rust/target/x86_64-unknown-linux-musl/release/har
+          src/rust/target/x86_64-unknown-linux-musl/release/har --version
+
+      - name: Prepare release assets
+        run: |
+          cp src/rust/target/x86_64-unknown-linux-musl/release/har har-linux-x86_64
+          chmod +x har-linux-x86_64
+          sha256sum har-linux-x86_64 > har-linux-x86_64.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: har-linux-x86_64
+          path: |
+            har-linux-x86_64
+            har-linux-x86_64.sha256
+            LICENSE
+            THIRD-PARTY-NOTICES
+
+  release:
+    name: Create GitHub Release
+    needs: build-static
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: har-linux-x86_64
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "${TAG}" \
+            --title "har ${TAG}" \
+            --generate-notes \
+            har-linux-x86_64 \
+            har-linux-x86_64.sha256 \
+            LICENSE \
+            THIRD-PARTY-NOTICES
