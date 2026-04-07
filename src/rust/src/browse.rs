@@ -498,6 +498,10 @@ fn sort_tree(node: &mut TreeNode) {
     node.child_count = node.children.iter().map(|c| {
         if c.node_type == NodeType::Dataset { 1 } else { c.child_count }
     }).sum();
+    // Accumulate size from children for groups
+    if node.node_type != NodeType::Dataset {
+        node.size_bytes = node.children.iter().map(|c| c.size_bytes).sum();
+    }
 }
 
 fn flatten(node: &TreeNode, out: &mut Vec<VisibleRow>, skip_root: bool) {
@@ -551,7 +555,7 @@ fn find_node_mut<'a>(root: &'a mut TreeNode, path: &str) -> Option<&'a mut TreeN
 // Detail info collection
 // ---------------------------------------------------------------------------
 
-fn collect_detail_legacy(h5_path: &str, path: &str, node_type: &NodeType) -> Vec<DetailLine> {
+fn collect_detail_legacy(h5_path: &str, path: &str, node_type: &NodeType, size_bytes: u64, _child_count: usize) -> Vec<DetailLine> {
     let mut lines = Vec::new();
 
     let h5f = match hdf5::File::open(h5_path) {
@@ -678,9 +682,15 @@ fn collect_detail_legacy(h5_path: &str, path: &str, node_type: &NodeType) -> Vec
                 let members = grp.member_names().unwrap_or_default();
                 lines.push(DetailLine { text: "GROUP INFO".into(), is_header: true});
                 lines.push(DetailLine {
-                    text: format!("  Children  {}", members.len()),
+                    text: format!("  Children    {}", members.len()),
                     is_header: false,
                 });
+                if size_bytes > 0 {
+                    lines.push(DetailLine {
+                        text: format!("  Total size  {}", human_size(size_bytes)),
+                        is_header: false,
+                    });
+                }
                 let attrs = grp.attr_names().unwrap_or_default();
                 if !attrs.is_empty() {
                     lines.push(DetailLine { text: String::new(), is_header: false });
@@ -702,7 +712,7 @@ fn collect_detail_legacy(h5_path: &str, path: &str, node_type: &NodeType) -> Vec
     lines
 }
 
-fn collect_detail_bagit(h5_path: &str, path: &str, node_type: &NodeType) -> Vec<DetailLine> {
+fn collect_detail_bagit(h5_path: &str, path: &str, node_type: &NodeType, size_bytes: u64, child_count: usize) -> Vec<DetailLine> {
     let mut lines = Vec::new();
 
     let h5f = match hdf5::File::open(h5_path) {
@@ -856,6 +866,16 @@ fn collect_detail_bagit(h5_path: &str, path: &str, node_type: &NodeType) -> Vec<
         }
         NodeType::Group => {
             lines.push(DetailLine { text: "GROUP".into(), is_header: true});
+            lines.push(DetailLine {
+                text: format!("  Children    {}", child_count),
+                is_header: false,
+            });
+            if size_bytes > 0 {
+                lines.push(DetailLine {
+                    text: format!("  Total size  {}", human_size(size_bytes)),
+                    is_header: false,
+                });
+            }
         }
         NodeType::EmptyDir => {
             lines.push(DetailLine { text: "EMPTY DIRECTORY".into(), is_header: true});
@@ -920,10 +940,15 @@ impl App {
             return Vec::new();
         };
 
-        let detail = if self.is_bagit {
-            collect_detail_bagit(&self.h5_path, &path, &node_type)
+        let (size_bytes, child_count) = if self.cursor < self.visible.len() {
+            (self.visible[self.cursor].size_bytes, self.visible[self.cursor].child_count)
         } else {
-            collect_detail_legacy(&self.h5_path, &path, &node_type)
+            (0, 0)
+        };
+        let detail = if self.is_bagit {
+            collect_detail_bagit(&self.h5_path, &path, &node_type, size_bytes, child_count)
+        } else {
+            collect_detail_legacy(&self.h5_path, &path, &node_type, size_bytes, child_count)
         };
         self.cached_detail_path = path;
         self.cached_detail = detail.clone();
@@ -1170,8 +1195,8 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
 
         let label = format!("{}{}{}{}", indent, icon, v.name, suffix);
 
-        // Size for datasets
-        let size_str = if v.node_type == NodeType::Dataset && v.size_bytes > 0 {
+        // Size for datasets and groups
+        let size_str = if v.size_bytes > 0 {
             human_size(v.size_bytes)
         } else {
             String::new()

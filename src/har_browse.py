@@ -79,7 +79,7 @@ def _build_tree_legacy(h5f):
 
     h5f.visititems(visitor)
 
-    # Sort children, compute child_count
+    # Sort children, compute child_count and accumulate size_bytes
     def _sort(node):
         node.children.sort(key=lambda c: (c.node_type == "dataset", c.name))
         node.child_count = sum(
@@ -88,6 +88,7 @@ def _build_tree_legacy(h5f):
         )
         for c in node.children:
             _sort(c)
+        node.size_bytes = sum(c.size_bytes for c in node.children)
 
     _sort(root)
     return root
@@ -205,6 +206,7 @@ def _build_tree_bagit(h5f):
         )
         for c in node.children:
             _sort(c)
+        node.size_bytes = sum(c.size_bytes for c in node.children)
 
     # BagIt tag files (show under a [bagit] virtual group)
     if "bagit" in h5f:
@@ -297,6 +299,8 @@ def _collect_detail_legacy(h5f, node):
         try:
             grp = h5f[node.full_path]
             rows = [("Children", str(len(grp.keys())))]
+            if node.size_bytes > 0:
+                rows.append(("Total size", _human_size(node.size_bytes)))
             attrs = [(k, str(grp.attrs[k])) for k in grp.attrs]
             if attrs:
                 sections.append(("GROUP INFO", rows))
@@ -319,7 +323,10 @@ def _collect_detail_bagit(h5f, node, is_bagit):
         if node.node_type == "empty_dir":
             sections.append(("EMPTY DIRECTORY", [("Path", node.full_path)]))
         else:
-            sections.append(("GROUP", [("Children", str(node.child_count))]))
+            rows = [("Children", str(node.child_count))]
+            if node.size_bytes > 0:
+                rows.append(("Total size", _human_size(node.size_bytes)))
+            sections.append(("GROUP", rows))
         return sections
 
     # BagIt tag files (under virtual [bagit]/ group)
@@ -671,9 +678,9 @@ class BrowseApp:
                 elif n.node_type == "empty_dir":
                     label += "/  [empty]"
 
-                # Size for datasets
+                # Size for datasets and groups
                 size_str = ""
-                if n.node_type == "dataset" and n.size_bytes > 0:
+                if n.size_bytes > 0:
                     size_str = _human_size(n.size_bytes)
 
                 # Fit into left pane
