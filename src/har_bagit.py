@@ -21,13 +21,25 @@ import numpy as np
 
 
 class ProgressBar:
-    """Simple terminal progress bar based on bytes processed."""
-    def __init__(self, total_bytes):
-        self.total = total_bytes
+    """Multi-phase terminal progress bar based on bytes processed."""
+    def __init__(self, verbose):
+        self.is_tty = sys.stderr.isatty() and verbose
+        self.completed = []
+        self.label = None
+        self.total = 0
         self.current = 0
         self.recent = []
         self.prev_lines = 0
-        self.is_tty = sys.stderr.isatty() and total_bytes > 0
+
+    def start_phase(self, label, total_bytes):
+        if self.label is not None:
+            self.completed.append((self.label, self.total))
+        self.label = label
+        self.total = total_bytes
+        self.current = 0
+        self.recent = []
+        if self.is_tty:
+            self._render()
 
     def update(self, filename, nbytes):
         self.current += nbytes
@@ -40,25 +52,46 @@ class ProgressBar:
     def _render(self):
         if self.prev_lines > 0:
             sys.stderr.write(f'\x1b[{self.prev_lines}A')
-        pct = self.current * 100.0 / max(self.total, 1)
+        lines = 0
         bar_width = 40
-        filled = int(bar_width * self.current / max(self.total, 1))
-        empty = bar_width - filled
-        cur_h = _human_size(self.current)
-        tot_h = _human_size(self.total)
-        sys.stderr.write(f'\x1b[2K[{"█" * filled}{"░" * empty}] {pct:.1f}% ({cur_h} / {tot_h})\n')
-        for f in self.recent:
-            sys.stderr.write(f'\x1b[2K  {f}\n')
-        self.prev_lines = 1 + len(self.recent)
+        for label, total in self.completed:
+            bar = '\u2588' * bar_width
+            tot_h = _human_size(total)
+            sys.stderr.write(f'\x1b[2K\u2713 {label:12s} [{bar}] 100.0% ({tot_h} / {tot_h})\n')
+            lines += 1
+        if self.label and self.total > 0:
+            pct = self.current * 100.0 / max(self.total, 1)
+            filled = int(bar_width * self.current / max(self.total, 1))
+            empty = bar_width - filled
+            cur_h = _human_size(self.current)
+            tot_h = _human_size(self.total)
+            sys.stderr.write(f'\x1b[2K  {self.label:12s} [{"█" * filled}{"░" * empty}] {pct:.1f}% ({cur_h} / {tot_h})\n')
+            lines += 1
+            for f in self.recent:
+                sys.stderr.write(f'\x1b[2K    {f}\n')
+                lines += 1
+        self.prev_lines = lines
         sys.stderr.flush()
 
     def finish(self):
+        if self.label is not None:
+            self.completed.append((self.label, self.total))
+            self.label = None
         if not self.is_tty or self.prev_lines == 0:
             return
         sys.stderr.write(f'\x1b[{self.prev_lines}A')
-        for _ in range(self.prev_lines):
+        bar_width = 40
+        bar = '\u2588' * bar_width
+        lines = 0
+        for label, total in self.completed:
+            tot_h = _human_size(total)
+            sys.stderr.write(f'\x1b[2K\u2713 {label:12s} [{bar}] 100.0% ({tot_h} / {tot_h})\n')
+            lines += 1
+        for _ in range(self.prev_lines - lines):
             sys.stderr.write('\x1b[2K\n')
-        sys.stderr.write(f'\x1b[{self.prev_lines}A')
+        extra = self.prev_lines - lines
+        if extra > 0:
+            sys.stderr.write(f'\x1b[{extra}A')
         sys.stderr.flush()
         self.prev_lines = 0
 
@@ -298,50 +331,6 @@ def _assign_batches_streaming(file_entries, batch_size):
 # Batching
 # ---------------------------------------------------------------------------
 
-def _assign_batches(inventory, batch_size):
-    """Assign files to batches.
-
-    inventory: list of (rel_path, content_bytes, mode, sha256_hex, uid, gid, mtime, owner, group_name)
-               sorted by rel_path.
-
-    Returns list of batch dicts:
-      [{'id': int,
-        'files': [(rel_path, content, mode, sha256, offset_in_batch, uid, gid, mtime, owner, group_name), ...],
-        'total_bytes': int}, ...]
-    """
-    batches = []
-    current_files = []
-    current_bytes = 0
-    batch_id = 0
-
-    for rel_path, content, mode, sha256, uid, gid, mtime, owner, group_name in inventory:
-        fsize = len(content)
-        # Start a new batch if adding this file would exceed target
-        # (unless current batch is empty — always accept at least one file).
-        if current_bytes + fsize > batch_size and current_files:
-            batches.append({
-                'id': batch_id,
-                'files': current_files,
-                'total_bytes': current_bytes,
-            })
-            batch_id += 1
-            current_files = []
-            current_bytes = 0
-
-        current_files.append((rel_path, content, mode, sha256, current_bytes, uid, gid, mtime, owner, group_name))
-        current_bytes += fsize
-
-    # Finalize last batch
-    if current_files:
-        batches.append({
-            'id': batch_id,
-            'files': current_files,
-            'total_bytes': current_bytes,
-        })
-
-    return batches
-
-
 # ---------------------------------------------------------------------------
 # BagIt manifest generation
 # ---------------------------------------------------------------------------
@@ -390,117 +379,110 @@ def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
                shuffle=False, batch_size=DEFAULT_BATCH_SIZE, parallel=1,
                verbose=False, checksum=None, xattr_flag=False,
                validate=False):
-    """Create a BagIt-mode HDF5 archive with batched storage."""
+    """Create a BagIt-mode HDF5 archive with batched storage (streaming)."""
     output_h5 = os.path.expanduser(output_h5)
     t0 = time.time()
     hash_algo = checksum or 'sha256'
 
-    # Phase 1: Inventory
+    # 1. Inventory (stat only, no content read)
     file_entries, empty_dirs = build_inventory(sources)
     if verbose:
         print(f"Inventory: {len(file_entries)} files, {len(empty_dirs)} empty dirs")
 
-    # Phase 2: Read + checksum (parallelizable)
-    total_size = sum(os.path.getsize(fp) for fp, _ in file_entries)
-    progress = ProgressBar(total_size if verbose else 0)
-    verbose_file = verbose and not progress.is_tty
+    # 2. Stat + sort
+    sized_entries = []
+    for abs_path, rel_path in sorted(file_entries, key=lambda x: x[1]):
+        fsize = os.path.getsize(abs_path)
+        sized_entries.append((abs_path, rel_path, fsize))
+    total_size = sum(s for _, _, s in sized_entries)
+    file_count = len(sized_entries)
 
-    user_metadata_map = {}
-
-    if parallel <= 1:
-        inventory = []
-        for file_path, rel_path in sorted(file_entries, key=lambda x: x[1]):
-            content, mode, hash_hex, uid, gid, mtime, owner, group_name = _read_and_hash(file_path, hash_algo)
-            bagit_path = "data/" + rel_path
-            inventory.append((bagit_path, content, mode, hash_hex, uid, gid, mtime, owner, group_name))
-            if xattr_flag:
-                from har import _read_xattrs
-                xattrs = _read_xattrs(file_path)
-                if xattrs:
-                    xmap = {}
-                    for name, value in xattrs.items():
-                        xmap[name] = 'base64:' + base64.b64encode(value).decode('ascii')
-                    user_metadata_map[rel_path] = {'xattrs': xmap}
-            progress.update(rel_path, len(content))
-            if verbose_file:
-                print(f"  Read: {rel_path}")
-    else:
-        sorted_entries = sorted(file_entries, key=lambda x: x[1])
-        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
-            futures = [executor.submit(_read_and_hash, fp, hash_algo) for fp, _ in sorted_entries]
-            inventory = []
-            for (file_path, rel_path), future in zip(sorted_entries, futures):
-                content, mode, hash_hex, uid, gid, mtime, owner, group_name = future.result()
-                bagit_path = "data/" + rel_path
-                inventory.append((bagit_path, content, mode, hash_hex, uid, gid, mtime, owner, group_name))
-                if xattr_flag:
-                    from har import _read_xattrs
-                    xattrs = _read_xattrs(file_path)
-                    if xattrs:
-                        xmap = {}
-                        for name, value in xattrs.items():
-                            xmap[name] = 'base64:' + base64.b64encode(value).decode('ascii')
-                        user_metadata_map[rel_path] = {'xattrs': xmap}
-                progress.update(rel_path, len(content))
-                if verbose_file:
-                    print(f"  Read: {rel_path}")
-    progress.finish()
-
-    # Phase 3: Batch assignment
-    batches = _assign_batches(inventory, batch_size)
+    # 3. Batch assign (by size, no content)
+    batches = _assign_batches_streaming(sized_entries, batch_size)
     if verbose:
         print(f"Batches: {len(batches)} (target {_human_size(batch_size)})")
 
-    # Phase 4: Build BagIt manifests
-    total_bytes = sum(len(content) for _, content, _, _, _, _, _, _, _ in inventory)
-    file_count = len(inventory)
+    progress = ProgressBar(verbose)
+    progress.start_phase("Archiving", total_size)
+    verbose_file = verbose and not progress.is_tty
 
-    manifest_records = [(path, hash_hex) for path, _, _, hash_hex, _, _, _, _, _ in inventory]
-    manifest_name = f'manifest-{hash_algo}.txt'
-    tagmanifest_name = f'tagmanifest-{hash_algo}.txt'
-    bagit_txt = _generate_bagit_txt()
-    bag_info_txt = _generate_bag_info(total_bytes, file_count)
-    manifest_txt = _generate_manifest(manifest_records)
-    tagmanifest_txt = _generate_tagmanifest({
-        'bagit.txt': bagit_txt,
-        'bag-info.txt': bag_info_txt,
-        manifest_name: manifest_txt,
-    }, hash_algo)
+    # 4. Stream: read+hash+write one batch at a time
+    index_records = []
+    manifest_records = []
+    user_metadata_map = {}
+    total_bytes = 0
 
-    # Phase 5: Write HDF5
     with h5py.File(output_h5, 'w') as h5f:
-        # Root attributes
         h5f.attrs[HAR_FORMAT_ATTR] = HAR_FORMAT_VALUE
         h5f.attrs[HAR_VERSION_ATTR] = HAR_VERSION_VALUE
         h5f.attrs['har_checksum_algo'] = hash_algo
 
-        # Index dataset
-        index_arr = np.zeros(file_count, dtype=INDEX_DTYPE)
-        i = 0
-        for batch in batches:
-            for rel_path, content, mode, sha256, offset, uid, gid, mtime, owner, group_name in batch['files']:
-                index_arr[i]['path'] = rel_path.encode('utf-8')
-                index_arr[i]['batch_id'] = batch['id']
-                index_arr[i]['offset'] = offset
-                index_arr[i]['length'] = len(content)
-                index_arr[i]['mode'] = mode
-                index_arr[i]['sha256'] = sha256.encode('ascii')
-                index_arr[i]['uid'] = uid
-                index_arr[i]['gid'] = gid
-                index_arr[i]['mtime'] = mtime
-                index_arr[i]['owner'] = owner.encode('utf-8')
-                index_arr[i]['group_name'] = group_name.encode('utf-8')
-                i += 1
-
-        h5f.create_dataset('index', data=index_arr, compression='gzip',
-                           compression_opts=9)
-
-        # Batch datasets
         batches_grp = h5f.create_group('batches')
+
         for batch in batches:
-            buf = bytearray(batch['total_bytes'])
-            for _, content, _, _, offset, _, _, _, _, _ in batch['files']:
-                buf[offset:offset + len(content)] = content
+            batch_buffer = bytearray(batch['total_bytes'])
+            batch_file_records = []
+
+            if parallel <= 1:
+                for abs_path, rel_path, fsize, offset in batch['files']:
+                    bagit_path = "data/" + rel_path
+                    content, mode, hash_hex, uid, gid, mtime, owner, group_name = \
+                        _read_and_hash(abs_path, hash_algo)
+                    batch_buffer[offset:offset + len(content)] = content
+                    batch_file_records.append({
+                        'bagit_path': bagit_path, 'batch_id': batch['id'],
+                        'offset': offset, 'length': len(content),
+                        'mode': mode, 'sha256': hash_hex,
+                        'uid': uid, 'gid': gid, 'mtime': mtime,
+                        'owner': owner, 'group_name': group_name,
+                    })
+                    manifest_records.append((bagit_path, hash_hex))
+                    if xattr_flag:
+                        from har import _read_xattrs
+                        xattrs = _read_xattrs(abs_path)
+                        if xattrs:
+                            xmap = {}
+                            for name, value in xattrs.items():
+                                xmap[name] = 'base64:' + base64.b64encode(value).decode('ascii')
+                            user_metadata_map[rel_path] = {'xattrs': xmap}
+                    progress.update(rel_path, len(content))
+                    if verbose_file:
+                        print(f"  {rel_path}")
+            else:
+                entries_in_batch = batch['files']
+                with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
+                    futures = [executor.submit(_read_and_hash, e[0], hash_algo)
+                               for e in entries_in_batch]
+                    for (abs_path, rel_path, fsize, offset), future in \
+                            zip(entries_in_batch, futures):
+                        content, mode, hash_hex, uid, gid, mtime, owner, group_name = \
+                            future.result()
+                        bagit_path = "data/" + rel_path
+                        batch_buffer[offset:offset + len(content)] = content
+                        batch_file_records.append({
+                            'bagit_path': bagit_path, 'batch_id': batch['id'],
+                            'offset': offset, 'length': len(content),
+                            'mode': mode, 'sha256': hash_hex,
+                            'uid': uid, 'gid': gid, 'mtime': mtime,
+                            'owner': owner, 'group_name': group_name,
+                        })
+                        manifest_records.append((bagit_path, hash_hex))
+                        if xattr_flag:
+                            from har import _read_xattrs
+                            xattrs = _read_xattrs(abs_path)
+                            if xattrs:
+                                xmap = {}
+                                for name, value in xattrs.items():
+                                    xmap[name] = 'base64:' + base64.b64encode(value).decode('ascii')
+                                user_metadata_map[rel_path] = {'xattrs': xmap}
+                        progress.update(rel_path, len(content))
+                        if verbose_file:
+                            print(f"  {rel_path}")
+
+            index_records.extend(batch_file_records)
+            total_bytes += batch['total_bytes']
+
+            # Write this batch to HDF5 and free buffer
             ds_kwargs = {}
             if compression:
                 ds_kwargs['compression'] = compression
@@ -508,15 +490,41 @@ def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
                 ds_kwargs['shuffle'] = shuffle
             batches_grp.create_dataset(
                 str(batch['id']),
-                data=np.frombuffer(bytes(buf), dtype=np.uint8),
+                data=np.frombuffer(bytes(batch_buffer), dtype=np.uint8),
                 dtype=np.uint8,
                 **ds_kwargs,
             )
-            if verbose:
-                print(f"  Wrote batch {batch['id']}: "
-                      f"{len(batch['files'])} files, {_human_size(batch['total_bytes'])}")
+            del batch_buffer
+
+        # 5. Write index dataset
+        index_arr = np.zeros(file_count, dtype=INDEX_DTYPE)
+        for i, rec in enumerate(index_records):
+            index_arr[i]['path'] = rec['bagit_path'].encode('utf-8')
+            index_arr[i]['batch_id'] = rec['batch_id']
+            index_arr[i]['offset'] = rec['offset']
+            index_arr[i]['length'] = rec['length']
+            index_arr[i]['mode'] = rec['mode']
+            index_arr[i]['sha256'] = rec['sha256'].encode('ascii')
+            index_arr[i]['uid'] = rec['uid']
+            index_arr[i]['gid'] = rec['gid']
+            index_arr[i]['mtime'] = rec['mtime']
+            index_arr[i]['owner'] = rec['owner'].encode('utf-8')
+            index_arr[i]['group_name'] = rec['group_name'].encode('utf-8')
+        h5f.create_dataset('index', data=index_arr, compression='gzip',
+                           compression_opts=9)
 
         # BagIt tag files
+        manifest_name = f'manifest-{hash_algo}.txt'
+        tagmanifest_name = f'tagmanifest-{hash_algo}.txt'
+        bagit_txt = _generate_bagit_txt()
+        bag_info_txt = _generate_bag_info(total_bytes, file_count)
+        manifest_txt = _generate_manifest(manifest_records)
+        tagmanifest_txt = _generate_tagmanifest({
+            'bagit.txt': bagit_txt,
+            'bag-info.txt': bag_info_txt,
+            manifest_name: manifest_txt,
+        }, hash_algo)
+
         bagit_grp = h5f.create_group('bagit')
         for name, content in [('bagit.txt', bagit_txt),
                               ('bag-info.txt', bag_info_txt),
@@ -540,6 +548,8 @@ def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
             h5f.create_dataset('user_metadata',
                                data=np.frombuffer(json_blob, dtype=np.uint8),
                                dtype=np.uint8)
+
+    progress.finish()
 
     t1 = time.time()
     print(f"\nOperation completed in {t1 - t0:.2f} seconds.")
@@ -1115,7 +1125,8 @@ def extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
         batch_ids = sorted(by_batch.keys())
         file_count = len(index)
         total_bytes = sum(int(rec['length']) for rec in index)
-        progress = ProgressBar(total_bytes if verbose else 0)
+        progress = ProgressBar(verbose)
+        progress.start_phase("Extracting", total_bytes)
         verbose_file = verbose and not progress.is_tty
 
         def _extract_from_batch(batch_id, records, batch_data):

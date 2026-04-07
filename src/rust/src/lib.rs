@@ -25,21 +25,38 @@ fn human_size_bytes(nbytes: u64) -> String {
 }
 
 pub struct Progress {
+    pub is_tty: bool,
+    completed: Vec<(String, u64)>,
+    label: Option<String>,
     total: u64,
     current: u64,
     recent: Vec<String>,
     prev_lines: usize,
-    pub is_tty: bool,
 }
 
 impl Progress {
-    pub fn new(total_bytes: u64) -> Self {
+    pub fn new(verbose: bool) -> Self {
         Progress {
-            total: total_bytes,
+            is_tty: io::stderr().is_terminal() && verbose,
+            completed: Vec::new(),
+            label: None,
+            total: 0,
             current: 0,
             recent: Vec::new(),
             prev_lines: 0,
-            is_tty: io::stderr().is_terminal() && total_bytes > 0,
+        }
+    }
+
+    pub fn start_phase(&mut self, label: &str, total_bytes: u64) {
+        if let Some(prev_label) = self.label.take() {
+            self.completed.push((prev_label, self.total));
+        }
+        self.label = Some(label.to_string());
+        self.total = total_bytes;
+        self.current = 0;
+        self.recent.clear();
+        if self.is_tty {
+            self.render();
         }
     }
 
@@ -60,40 +77,66 @@ impl Progress {
             write!(err, "\x1b[{}A", self.prev_lines).ok();
         }
 
-        let pct = if self.total > 0 { self.current as f64 * 100.0 / self.total as f64 } else { 0.0 };
         let bar_width: usize = 40;
-        let filled = if self.total > 0 { (bar_width as u64 * self.current / self.total) as usize } else { 0 };
-        let empty = bar_width - filled;
+        let mut lines: usize = 0;
 
-        writeln!(
-            err,
-            "\x1b[2K[{}{}] {:.1}% ({} / {})",
-            "█".repeat(filled),
-            "░".repeat(empty),
-            pct,
-            human_size_bytes(self.current),
-            human_size_bytes(self.total)
-        )
-        .ok();
-
-        for f in &self.recent {
-            writeln!(err, "\x1b[2K  {}", f).ok();
+        for (label, total) in &self.completed {
+            let bar = "\u{2588}".repeat(bar_width);
+            let tot_h = human_size_bytes(*total);
+            writeln!(err, "\x1b[2K\u{2713} {:12} [{}] 100.0% ({} / {})",
+                     label, bar, tot_h, tot_h).ok();
+            lines += 1;
         }
 
-        self.prev_lines = 1 + self.recent.len();
+        if let Some(ref label) = self.label {
+            if self.total > 0 {
+                let pct = self.current as f64 * 100.0 / self.total as f64;
+                let filled = (bar_width as u64 * self.current / self.total) as usize;
+                let empty = bar_width - filled;
+                writeln!(err, "\x1b[2K  {:12} [{}{}] {:.1}% ({} / {})",
+                         label,
+                         "\u{2588}".repeat(filled),
+                         "\u{2591}".repeat(empty),
+                         pct,
+                         human_size_bytes(self.current),
+                         human_size_bytes(self.total)).ok();
+                lines += 1;
+                for f in &self.recent {
+                    writeln!(err, "\x1b[2K    {}", f).ok();
+                    lines += 1;
+                }
+            }
+        }
+
+        self.prev_lines = lines;
         err.flush().ok();
     }
 
     pub fn finish(&mut self) {
+        if let Some(prev_label) = self.label.take() {
+            self.completed.push((prev_label, self.total));
+        }
         if !self.is_tty || self.prev_lines == 0 {
             return;
         }
         let mut err = io::stderr().lock();
         write!(err, "\x1b[{}A", self.prev_lines).ok();
-        for _ in 0..self.prev_lines {
+        let bar_width: usize = 40;
+        let bar = "\u{2588}".repeat(bar_width);
+        let mut lines: usize = 0;
+        for (label, total) in &self.completed {
+            let tot_h = human_size_bytes(*total);
+            writeln!(err, "\x1b[2K\u{2713} {:12} [{}] 100.0% ({} / {})",
+                     label, bar, tot_h, tot_h).ok();
+            lines += 1;
+        }
+        for _ in 0..(self.prev_lines.saturating_sub(lines)) {
             writeln!(err, "\x1b[2K").ok();
         }
-        write!(err, "\x1b[{}A", self.prev_lines).ok();
+        let extra = self.prev_lines.saturating_sub(lines);
+        if extra > 0 {
+            write!(err, "\x1b[{}A", extra).ok();
+        }
         err.flush().ok();
         self.prev_lines = 0;
     }
@@ -414,7 +457,7 @@ pub fn pack_or_append_to_h5(
     let total_size: u64 = file_entries.iter().map(|e| {
         fs::metadata(&e.file_path).map(|m| m.len()).unwrap_or(0)
     }).sum();
-    let mut progress = Progress::new(if verbose { total_size } else { 0 });
+    let mut progress = Progress::new(verbose);
     let verbose_file = verbose && !progress.is_tty;
     let mut validation_errors: Vec<String> = Vec::new();
     let mut validated_count: usize = 0;
@@ -464,6 +507,7 @@ pub fn pack_or_append_to_h5(
 
     if parallel <= 1 {
         // Sequential path
+        progress.start_phase("Archiving", total_size);
         for entry in &file_entries {
             let fd = read_file(&entry.file_path).expect("Failed to read file");
             write_to_h5(&h5f, &entry.rel_path, &fd.content, fd.mode, fd.uid, fd.gid, &fd.owner, &fd.group, fd.mtime, true, Some(&entry.file_path));
@@ -496,6 +540,7 @@ pub fn pack_or_append_to_h5(
             ensure_group(&h5f, g);
         }
 
+        progress.start_phase("Reading", total_size);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(parallel)
             .build()
@@ -518,7 +563,11 @@ pub fn pack_or_append_to_h5(
                 })
                 .collect()
         });
+        for r in &read_results {
+            progress.inc(&r.rel_path, r.content.len() as u64);
+        }
 
+        progress.start_phase("Writing", total_size);
         for r in &read_results {
             write_to_h5(&h5f, &r.rel_path, &r.content, r.mode, r.uid, r.gid, &r.owner, &r.group, r.mtime, false, Some(&r.file_path));
             if validate {
@@ -710,7 +759,8 @@ pub fn extract_h5_to_directory(
                 None
             }
         }).sum();
-        let mut progress = Progress::new(if verbose { total_bytes } else { 0 });
+        let mut progress = Progress::new(verbose);
+        progress.start_phase("Extracting", total_bytes);
         let verbose_file = verbose && !progress.is_tty;
 
         if parallel <= 1 {

@@ -24,35 +24,36 @@ struct FileEntry {
     rel_path: String,
 }
 
-struct InventoryItem {
-    bagit_path: String,
-    content: Vec<u8>,
-    mode: u32,
-    sha256: String,
-    uid: u32,
-    gid: u32,
-    mtime: f64,
-    owner: String,
-    group: String,
+struct SizedEntry {
+    file_path: std::path::PathBuf,
+    rel_path: String,
+    size: u64,
 }
 
-struct BatchFile {
-    bagit_path: String,
-    content: Vec<u8>,
-    mode: u32,
-    sha256: String,
+struct StreamingBatchFile {
+    file_path: std::path::PathBuf,
+    rel_path: String,
     offset: usize,
+}
+
+struct StreamingBatch {
+    id: u32,
+    files: Vec<StreamingBatchFile>,
+    total_bytes: usize,
+}
+
+struct IndexRecord {
+    bagit_path: String,
+    batch_id: u32,
+    offset: u64,
+    length: u64,
+    mode: u32,
+    sha256: String,
     uid: u32,
     gid: u32,
     mtime: f64,
     owner: String,
     group: String,
-}
-
-struct Batch {
-    id: u32,
-    files: Vec<BatchFile>,
-    total_bytes: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -179,16 +180,16 @@ fn build_inventory(sources: &[&str]) -> (Vec<FileEntry>, Vec<String>) {
 // Batching
 // ---------------------------------------------------------------------------
 
-fn assign_batches(inventory: Vec<InventoryItem>, batch_size: usize) -> Vec<Batch> {
+fn assign_batches_streaming(entries: &[SizedEntry], batch_size: usize) -> Vec<StreamingBatch> {
     let mut batches = Vec::new();
     let mut current_files = Vec::new();
     let mut current_bytes: usize = 0;
     let mut batch_id: u32 = 0;
 
-    for item in inventory {
-        let fsize = item.content.len();
+    for entry in entries {
+        let fsize = entry.size as usize;
         if current_bytes + fsize > batch_size && !current_files.is_empty() {
-            batches.push(Batch {
+            batches.push(StreamingBatch {
                 id: batch_id,
                 files: current_files,
                 total_bytes: current_bytes,
@@ -197,22 +198,15 @@ fn assign_batches(inventory: Vec<InventoryItem>, batch_size: usize) -> Vec<Batch
             current_files = Vec::new();
             current_bytes = 0;
         }
-        current_files.push(BatchFile {
-            bagit_path: item.bagit_path,
-            content: item.content,
-            mode: item.mode,
-            sha256: item.sha256,
+        current_files.push(StreamingBatchFile {
+            file_path: entry.file_path.clone(),
+            rel_path: entry.rel_path.clone(),
             offset: current_bytes,
-            uid: item.uid,
-            gid: item.gid,
-            mtime: item.mtime,
-            owner: item.owner,
-            group: item.group,
         });
         current_bytes += fsize;
     }
     if !current_files.is_empty() {
-        batches.push(Batch {
+        batches.push(StreamingBatch {
             id: batch_id,
             files: current_files,
             total_bytes: current_bytes,
@@ -281,8 +275,9 @@ pub fn pack_bagit(
 ) {
     let output_h5 = shellexpand::tilde(output_h5).to_string();
     let t0 = Instant::now();
+    let hash_algo = checksum.unwrap_or("sha256");
 
-    // Phase 1: Inventory
+    // 1. Inventory (stat only, no content read)
     let (file_entries, empty_dirs) = build_inventory(sources);
     let mut sorted_entries = file_entries;
     sorted_entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -291,124 +286,35 @@ pub fn pack_bagit(
         println!("Inventory: {} files, {} empty dirs", sorted_entries.len(), empty_dirs.len());
     }
 
-    // Phase 2: Read + checksum
-    let hash_algo = checksum.unwrap_or("sha256");
-    let total_size: u64 = sorted_entries.iter().map(|e| {
-        std::fs::metadata(&e.file_path).map(|m| m.len()).unwrap_or(0)
-    }).sum();
-    let mut progress = crate::Progress::new(if verbose { total_size } else { 0 });
-    let verbose_file = verbose && !progress.is_tty;
+    // 2. Stat + sort → sized entries
+    let sized_entries: Vec<SizedEntry> = sorted_entries
+        .into_iter()
+        .map(|e| {
+            let size = std::fs::metadata(&e.file_path).map(|m| m.len()).unwrap_or(0);
+            SizedEntry { file_path: e.file_path, rel_path: e.rel_path, size }
+        })
+        .collect();
+    let total_size: u64 = sized_entries.iter().map(|e| e.size).sum();
+    let file_count = sized_entries.len();
 
-    let mut user_metadata_map: std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>> =
-        std::collections::BTreeMap::new();
-
-    let inventory: Vec<InventoryItem> = if parallel <= 1 {
-        sorted_entries
-            .iter()
-            .map(|e| {
-                let hr = read_and_hash(&e.file_path, hash_algo).expect("Failed to read file");
-                if xattr_flag {
-                    let xattrs = crate::metadata::read_xattrs(&e.file_path);
-                    if !xattrs.is_empty() {
-                        use base64::Engine;
-                        let mut xmap = serde_json::Map::new();
-                        for (name, value) in &xattrs {
-                            let encoded = base64::engine::general_purpose::STANDARD.encode(value);
-                            xmap.insert(name.clone(), serde_json::json!(format!("base64:{}", encoded)));
-                        }
-                        let mut entry = serde_json::Map::new();
-                        entry.insert("xattrs".to_string(), serde_json::Value::Object(xmap));
-                        user_metadata_map.insert(e.rel_path.clone(), entry);
-                    }
-                }
-                let content_len = hr.content.len() as u64;
-                progress.inc(&e.rel_path, content_len);
-                if verbose_file {
-                    println!("  Read: {}", e.rel_path);
-                }
-                InventoryItem {
-                    bagit_path: format!("data/{}", e.rel_path),
-                    content: hr.content,
-                    mode: hr.mode,
-                    sha256: hr.hash,
-                    uid: hr.uid, gid: hr.gid, mtime: hr.mtime,
-                    owner: hr.owner, group: hr.group,
-                }
-            })
-            .collect()
-    } else {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(parallel)
-            .build()
-            .expect("Failed to build thread pool");
-        let items: Vec<InventoryItem> = pool.install(|| {
-            sorted_entries
-                .par_iter()
-                .map(|e| {
-                    let hr = read_and_hash(&e.file_path, hash_algo).expect("Failed to read file");
-                    InventoryItem {
-                        bagit_path: format!("data/{}", e.rel_path),
-                        content: hr.content,
-                        mode: hr.mode,
-                        sha256: hr.hash,
-                        uid: hr.uid, gid: hr.gid, mtime: hr.mtime,
-                        owner: hr.owner, group: hr.group,
-                    }
-                })
-                .collect()
-        });
-        if xattr_flag {
-            for (item, entry) in items.iter().zip(sorted_entries.iter()) {
-                let xattrs = crate::metadata::read_xattrs(&entry.file_path);
-                if !xattrs.is_empty() {
-                    use base64::Engine;
-                    let mut xmap = serde_json::Map::new();
-                    for (name, value) in &xattrs {
-                        let encoded = base64::engine::general_purpose::STANDARD.encode(value);
-                        xmap.insert(name.clone(), serde_json::json!(format!("base64:{}", encoded)));
-                    }
-                    let mut meta_entry = serde_json::Map::new();
-                    meta_entry.insert("xattrs".to_string(), serde_json::Value::Object(xmap));
-                    let rel = item.bagit_path.strip_prefix("data/").unwrap_or(&item.bagit_path);
-                    user_metadata_map.insert(rel.to_string(), meta_entry);
-                }
-            }
-        }
-        for item in &items {
-            progress.inc(&item.bagit_path, item.content.len() as u64);
-        }
-        items
-    };
-    progress.finish();
-
-    // Phase 3: Batch assignment
-    let total_bytes: usize = inventory.iter().map(|i| i.content.len()).sum();
-    let file_count = inventory.len();
-    let batches = assign_batches(inventory, batch_size);
-
+    // 3. Batch assign (by size, no content)
+    let batches = assign_batches_streaming(&sized_entries, batch_size);
     if verbose {
         println!("Batches: {} (target {})", batches.len(), human_size(batch_size));
     }
 
-    // Phase 4: Build BagIt manifests
-    let manifest_records: Vec<(String, String)> = batches
-        .iter()
-        .flat_map(|b| b.files.iter())
-        .map(|f| (f.bagit_path.clone(), f.sha256.clone()))
-        .collect();
+    let mut progress = crate::Progress::new(verbose);
+    progress.start_phase("Archiving", total_size);
+    let verbose_file = verbose && !progress.is_tty;
 
-    let manifest_name = format!("manifest-{}.txt", hash_algo);
-    let tagmanifest_name = format!("tagmanifest-{}.txt", hash_algo);
-    let bagit_txt = generate_bagit_txt();
-    let bag_info_txt = generate_bag_info(total_bytes, file_count);
-    let manifest_txt = generate_manifest(&manifest_records);
-    let tagmanifest_txt = generate_tagmanifest(&[
-        ("bagit.txt", &bagit_txt),
-        ("bag-info.txt", &bag_info_txt),
-        (&manifest_name, &manifest_txt),
-    ], hash_algo);
+    // 4. Stream: read+hash+write one batch at a time
+    let mut index_records: Vec<IndexRecord> = Vec::new();
+    let mut manifest_records: Vec<(String, String)> = Vec::new();
+    let mut user_metadata_map: std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>> =
+        std::collections::BTreeMap::new();
+    let mut total_bytes: usize = 0;
 
-    // Phase 5: Write HDF5
+    let is_lzma = compression == Some("lzma");
     let h5f = hdf5::File::create(&output_h5)
         .unwrap_or_else(|e| panic!("Failed to create '{}': {}", output_h5, e));
 
@@ -432,89 +338,110 @@ pub fn pack_bagit(
         .write_scalar(&hash_algo.parse::<hdf5::types::VarLenUnicode>().unwrap())
         .unwrap();
 
-    // Index — store as parallel arrays (simpler than compound types in hdf5-rs)
-    let idx_grp = h5f.create_group("index_data").unwrap();
-
-    let paths_data: Vec<String> = batches
-        .iter()
-        .flat_map(|b| b.files.iter().map(|f| f.bagit_path.clone()))
-        .collect();
-    let batch_ids: Vec<u32> = batches
-        .iter()
-        .flat_map(|b| b.files.iter().map(|_| b.id))
-        .collect();
-    let offsets: Vec<u64> = batches
-        .iter()
-        .flat_map(|b| b.files.iter().map(|f| f.offset as u64))
-        .collect();
-    let lengths: Vec<u64> = batches
-        .iter()
-        .flat_map(|b| b.files.iter().map(|f| f.content.len() as u64))
-        .collect();
-    let modes: Vec<u32> = batches
-        .iter()
-        .flat_map(|b| b.files.iter().map(|f| f.mode))
-        .collect();
-    let shas: Vec<String> = batches
-        .iter()
-        .flat_map(|b| b.files.iter().map(|f| f.sha256.clone()))
-        .collect();
-    let uids: Vec<u32> = batches.iter().flat_map(|b| b.files.iter().map(|f| f.uid)).collect();
-    let gids: Vec<u32> = batches.iter().flat_map(|b| b.files.iter().map(|f| f.gid)).collect();
-    let mtimes: Vec<f64> = batches.iter().flat_map(|b| b.files.iter().map(|f| f.mtime)).collect();
-    let owners: Vec<String> = batches.iter().flat_map(|b| b.files.iter().map(|f| f.owner.clone())).collect();
-    let groups: Vec<String> = batches.iter().flat_map(|b| b.files.iter().map(|f| f.group.clone())).collect();
-
-    // Write arrays
-    idx_grp.new_dataset::<u32>().shape(batch_ids.len()).create("batch_id").unwrap()
-        .write_raw(&batch_ids).unwrap();
-    idx_grp.new_dataset::<u64>().shape(offsets.len()).create("offset").unwrap()
-        .write_raw(&offsets).unwrap();
-    idx_grp.new_dataset::<u64>().shape(lengths.len()).create("length").unwrap()
-        .write_raw(&lengths).unwrap();
-    idx_grp.new_dataset::<u32>().shape(modes.len()).create("mode").unwrap()
-        .write_raw(&modes).unwrap();
-
-    // Store paths and shas as byte datasets (fixed-width, newline-joined)
-    let paths_blob = paths_data.join("\n").into_bytes();
-    idx_grp.new_dataset::<u8>().shape(paths_blob.len()).create("paths").unwrap()
-        .write_raw(&paths_blob).unwrap();
-    let shas_blob = shas.join("\n").into_bytes();
-    idx_grp.new_dataset::<u8>().shape(shas_blob.len()).create("sha256s").unwrap()
-        .write_raw(&shas_blob).unwrap();
-
-    // Owner/group/mtime arrays
-    idx_grp.new_dataset::<u32>().shape(uids.len()).create("uid").unwrap()
-        .write_raw(&uids).unwrap();
-    idx_grp.new_dataset::<u32>().shape(gids.len()).create("gid").unwrap()
-        .write_raw(&gids).unwrap();
-    idx_grp.new_dataset::<f64>().shape(mtimes.len()).create("mtime").unwrap()
-        .write_raw(&mtimes).unwrap();
-    let owners_blob = owners.join("\n").into_bytes();
-    idx_grp.new_dataset::<u8>().shape(owners_blob.len()).create("owners").unwrap()
-        .write_raw(&owners_blob).unwrap();
-    let groups_blob = groups.join("\n").into_bytes();
-    idx_grp.new_dataset::<u8>().shape(groups_blob.len()).create("groups").unwrap()
-        .write_raw(&groups_blob).unwrap();
-
-    // Store file count for parsing
-    idx_grp.new_attr::<u64>().shape(()).create("count").unwrap()
-        .write_scalar(&(file_count as u64)).unwrap();
-
-    // Batch datasets
-    let is_lzma = compression == Some("lzma");
     let batches_grp = h5f.create_group("batches").unwrap();
+
     for batch in &batches {
-        let mut buf = vec![0u8; batch.total_bytes];
-        for f in &batch.files {
-            buf[f.offset..f.offset + f.content.len()].copy_from_slice(&f.content);
+        let mut batch_buffer = vec![0u8; batch.total_bytes];
+        let mut batch_records: Vec<IndexRecord> = Vec::new();
+
+        if parallel <= 1 {
+            for f in &batch.files {
+                let hr = read_and_hash(&f.file_path, hash_algo).expect("Failed to read file");
+                let bagit_path = format!("data/{}", f.rel_path);
+                let content_len = hr.content.len();
+                batch_buffer[f.offset..f.offset + content_len].copy_from_slice(&hr.content);
+                batch_records.push(IndexRecord {
+                    bagit_path: bagit_path.clone(),
+                    batch_id: batch.id,
+                    offset: f.offset as u64,
+                    length: content_len as u64,
+                    mode: hr.mode,
+                    sha256: hr.hash.clone(),
+                    uid: hr.uid, gid: hr.gid, mtime: hr.mtime,
+                    owner: hr.owner, group: hr.group,
+                });
+                manifest_records.push((bagit_path, hr.hash));
+                if xattr_flag {
+                    let xattrs = crate::metadata::read_xattrs(&f.file_path);
+                    if !xattrs.is_empty() {
+                        use base64::Engine;
+                        let mut xmap = serde_json::Map::new();
+                        for (name, value) in &xattrs {
+                            let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+                            xmap.insert(name.clone(), serde_json::json!(format!("base64:{}", encoded)));
+                        }
+                        let mut entry = serde_json::Map::new();
+                        entry.insert("xattrs".to_string(), serde_json::Value::Object(xmap));
+                        user_metadata_map.insert(f.rel_path.clone(), entry);
+                    }
+                }
+                progress.inc(&f.rel_path, content_len as u64);
+                if verbose_file {
+                    println!("  {}", f.rel_path);
+                }
+            }
+        } else {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(parallel)
+                .build()
+                .expect("Failed to build thread pool");
+            let results: Vec<(usize, HashResult)> = pool.install(|| {
+                batch.files
+                    .par_iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        let hr = read_and_hash(&f.file_path, hash_algo).expect("Failed to read file");
+                        (i, hr)
+                    })
+                    .collect()
+            });
+            for (i, hr) in results {
+                let f = &batch.files[i];
+                let bagit_path = format!("data/{}", f.rel_path);
+                let content_len = hr.content.len();
+                batch_buffer[f.offset..f.offset + content_len].copy_from_slice(&hr.content);
+                batch_records.push(IndexRecord {
+                    bagit_path: bagit_path.clone(),
+                    batch_id: batch.id,
+                    offset: f.offset as u64,
+                    length: content_len as u64,
+                    mode: hr.mode,
+                    sha256: hr.hash.clone(),
+                    uid: hr.uid, gid: hr.gid, mtime: hr.mtime,
+                    owner: hr.owner, group: hr.group,
+                });
+                manifest_records.push((bagit_path, hr.hash));
+                if xattr_flag {
+                    let xattrs = crate::metadata::read_xattrs(&f.file_path);
+                    if !xattrs.is_empty() {
+                        use base64::Engine;
+                        let mut xmap = serde_json::Map::new();
+                        for (name, value) in &xattrs {
+                            let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+                            xmap.insert(name.clone(), serde_json::json!(format!("base64:{}", encoded)));
+                        }
+                        let mut meta_entry = serde_json::Map::new();
+                        meta_entry.insert("xattrs".to_string(), serde_json::Value::Object(xmap));
+                        user_metadata_map.insert(f.rel_path.clone(), meta_entry);
+                    }
+                }
+                progress.inc(&f.rel_path, content_len as u64);
+                if verbose_file {
+                    println!("  {}", f.rel_path);
+                }
+            }
         }
+
+        index_records.extend(batch_records);
+        total_bytes += batch.total_bytes;
+
+        // Write this batch to HDF5 and free buffer
         let write_buf;
         let data = if is_lzma {
-            write_buf = crate::lzma_compress(&buf);
+            write_buf = crate::lzma_compress(&batch_buffer);
             &write_buf[..]
         } else {
-            &buf[..]
+            &batch_buffer[..]
         };
         let builder = batches_grp.new_dataset::<u8>();
         let mut builder = builder.shape(data.len());
@@ -531,14 +458,70 @@ pub fn pack_bagit(
             ds.new_attr::<u8>().shape(()).create("har_lzma").unwrap()
                 .write_scalar(&1u8).unwrap();
         }
-
-        if verbose {
-            println!("  Wrote batch {}: {} files, {}",
-                     batch.id, batch.files.len(), human_size(batch.total_bytes));
-        }
+        drop(batch_buffer);
     }
 
+    // 5. Write index, manifests, empty_dirs, user_metadata
+
+    // Index — parallel arrays
+    let idx_grp = h5f.create_group("index_data").unwrap();
+
+    let paths_data: Vec<String> = index_records.iter().map(|r| r.bagit_path.clone()).collect();
+    let batch_ids: Vec<u32> = index_records.iter().map(|r| r.batch_id).collect();
+    let offsets: Vec<u64> = index_records.iter().map(|r| r.offset).collect();
+    let lengths: Vec<u64> = index_records.iter().map(|r| r.length).collect();
+    let modes: Vec<u32> = index_records.iter().map(|r| r.mode).collect();
+    let shas: Vec<String> = index_records.iter().map(|r| r.sha256.clone()).collect();
+    let uids: Vec<u32> = index_records.iter().map(|r| r.uid).collect();
+    let gids: Vec<u32> = index_records.iter().map(|r| r.gid).collect();
+    let mtimes: Vec<f64> = index_records.iter().map(|r| r.mtime).collect();
+    let owners: Vec<String> = index_records.iter().map(|r| r.owner.clone()).collect();
+    let groups: Vec<String> = index_records.iter().map(|r| r.group.clone()).collect();
+
+    idx_grp.new_dataset::<u32>().shape(batch_ids.len()).create("batch_id").unwrap()
+        .write_raw(&batch_ids).unwrap();
+    idx_grp.new_dataset::<u64>().shape(offsets.len()).create("offset").unwrap()
+        .write_raw(&offsets).unwrap();
+    idx_grp.new_dataset::<u64>().shape(lengths.len()).create("length").unwrap()
+        .write_raw(&lengths).unwrap();
+    idx_grp.new_dataset::<u32>().shape(modes.len()).create("mode").unwrap()
+        .write_raw(&modes).unwrap();
+
+    let paths_blob = paths_data.join("\n").into_bytes();
+    idx_grp.new_dataset::<u8>().shape(paths_blob.len()).create("paths").unwrap()
+        .write_raw(&paths_blob).unwrap();
+    let shas_blob = shas.join("\n").into_bytes();
+    idx_grp.new_dataset::<u8>().shape(shas_blob.len()).create("sha256s").unwrap()
+        .write_raw(&shas_blob).unwrap();
+
+    idx_grp.new_dataset::<u32>().shape(uids.len()).create("uid").unwrap()
+        .write_raw(&uids).unwrap();
+    idx_grp.new_dataset::<u32>().shape(gids.len()).create("gid").unwrap()
+        .write_raw(&gids).unwrap();
+    idx_grp.new_dataset::<f64>().shape(mtimes.len()).create("mtime").unwrap()
+        .write_raw(&mtimes).unwrap();
+    let owners_blob = owners.join("\n").into_bytes();
+    idx_grp.new_dataset::<u8>().shape(owners_blob.len()).create("owners").unwrap()
+        .write_raw(&owners_blob).unwrap();
+    let groups_blob = groups.join("\n").into_bytes();
+    idx_grp.new_dataset::<u8>().shape(groups_blob.len()).create("groups").unwrap()
+        .write_raw(&groups_blob).unwrap();
+
+    idx_grp.new_attr::<u64>().shape(()).create("count").unwrap()
+        .write_scalar(&(file_count as u64)).unwrap();
+
     // BagIt tag files
+    let manifest_name = format!("manifest-{}.txt", hash_algo);
+    let tagmanifest_name = format!("tagmanifest-{}.txt", hash_algo);
+    let bagit_txt = generate_bagit_txt();
+    let bag_info_txt = generate_bag_info(total_bytes, file_count);
+    let manifest_txt = generate_manifest(&manifest_records);
+    let tagmanifest_txt = generate_tagmanifest(&[
+        ("bagit.txt", &bagit_txt),
+        ("bag-info.txt", &bag_info_txt),
+        (&manifest_name, &manifest_txt),
+    ], hash_algo);
+
     let bagit_grp = h5f.create_group("bagit").unwrap();
     for (name, content) in &[
         ("bagit.txt", &bagit_txt[..]),
@@ -562,6 +545,7 @@ pub fn pack_bagit(
     crate::metadata::write_user_metadata_dataset(&h5f, &user_metadata_map);
 
     h5f.close().ok();
+    progress.finish();
     let elapsed = t0.elapsed().as_secs_f64();
     println!("\nOperation completed in {:.2} seconds.", elapsed);
     println!("  {} files in {} batches, {} payload, archive: {}",
@@ -761,7 +745,8 @@ pub fn extract_bagit(
 
     let mut errors = Vec::new();
     let total_bytes: u64 = lengths.iter().take(count).sum();
-    let mut progress = crate::Progress::new(if verbose { total_bytes } else { 0 });
+    let mut progress = crate::Progress::new(verbose);
+    progress.start_phase("Extracting", total_bytes);
     let verbose_file = verbose && !progress.is_tty;
 
     for (bid, indices) in &by_batch {

@@ -60,13 +60,25 @@ def _human_size(nbytes):
 
 
 class ProgressBar:
-    """Simple terminal progress bar based on bytes processed."""
-    def __init__(self, total_bytes):
-        self.total = total_bytes
+    """Multi-phase terminal progress bar based on bytes processed."""
+    def __init__(self, verbose):
+        self.is_tty = sys.stderr.isatty() and verbose
+        self.completed = []
+        self.label = None
+        self.total = 0
         self.current = 0
         self.recent = []
         self.prev_lines = 0
-        self.is_tty = sys.stderr.isatty() and total_bytes > 0
+
+    def start_phase(self, label, total_bytes):
+        if self.label is not None:
+            self.completed.append((self.label, self.total))
+        self.label = label
+        self.total = total_bytes
+        self.current = 0
+        self.recent = []
+        if self.is_tty:
+            self._render()
 
     def update(self, filename, nbytes):
         self.current += nbytes
@@ -79,25 +91,46 @@ class ProgressBar:
     def _render(self):
         if self.prev_lines > 0:
             sys.stderr.write(f'\x1b[{self.prev_lines}A')
-        pct = self.current * 100.0 / max(self.total, 1)
+        lines = 0
         bar_width = 40
-        filled = int(bar_width * self.current / max(self.total, 1))
-        empty = bar_width - filled
-        cur_h = _human_size(self.current)
-        tot_h = _human_size(self.total)
-        sys.stderr.write(f'\x1b[2K[{"█" * filled}{"░" * empty}] {pct:.1f}% ({cur_h} / {tot_h})\n')
-        for f in self.recent:
-            sys.stderr.write(f'\x1b[2K  {f}\n')
-        self.prev_lines = 1 + len(self.recent)
+        for label, total in self.completed:
+            bar = '\u2588' * bar_width
+            tot_h = _human_size(total)
+            sys.stderr.write(f'\x1b[2K\u2713 {label:12s} [{bar}] 100.0% ({tot_h} / {tot_h})\n')
+            lines += 1
+        if self.label and self.total > 0:
+            pct = self.current * 100.0 / max(self.total, 1)
+            filled = int(bar_width * self.current / max(self.total, 1))
+            empty = bar_width - filled
+            cur_h = _human_size(self.current)
+            tot_h = _human_size(self.total)
+            sys.stderr.write(f'\x1b[2K  {self.label:12s} [{"█" * filled}{"░" * empty}] {pct:.1f}% ({cur_h} / {tot_h})\n')
+            lines += 1
+            for f in self.recent:
+                sys.stderr.write(f'\x1b[2K    {f}\n')
+                lines += 1
+        self.prev_lines = lines
         sys.stderr.flush()
 
     def finish(self):
+        if self.label is not None:
+            self.completed.append((self.label, self.total))
+            self.label = None
         if not self.is_tty or self.prev_lines == 0:
             return
         sys.stderr.write(f'\x1b[{self.prev_lines}A')
-        for _ in range(self.prev_lines):
+        bar_width = 40
+        bar = '\u2588' * bar_width
+        lines = 0
+        for label, total in self.completed:
+            tot_h = _human_size(total)
+            sys.stderr.write(f'\x1b[2K\u2713 {label:12s} [{bar}] 100.0% ({tot_h} / {tot_h})\n')
+            lines += 1
+        for _ in range(self.prev_lines - lines):
             sys.stderr.write('\x1b[2K\n')
-        sys.stderr.write(f'\x1b[{self.prev_lines}A')
+        extra = self.prev_lines - lines
+        if extra > 0:
+            sys.stderr.write(f'\x1b[{extra}A')
         sys.stderr.flush()
         self.prev_lines = 0
 
@@ -318,7 +351,7 @@ def pack_or_append_to_h5(sources,
             print(f"Warning: '{source}' is not a valid file or directory; skipping.", file=sys.stderr)
 
     total_size = sum(os.path.getsize(fp) for fp, _ in file_entries)
-    progress = ProgressBar(total_size if verbose else 0)
+    progress = ProgressBar(verbose)
     verbose_file = verbose and not progress.is_tty
     validation_errors = []
     validated_count = [0]
@@ -369,6 +402,7 @@ def pack_or_append_to_h5(sources,
 
     if parallel <= 1:
         # Sequential path: read and write one file at a time (no extra memory).
+        progress.start_phase("Archiving", total_size)
         with h5py.File(output_h5, file_mode) as h5fobj:
             for file_path, rel_path in file_entries:
                 content, mode, uid, gid, owner, group, mtime = _read_file(file_path)
@@ -391,15 +425,18 @@ def pack_or_append_to_h5(sources,
             if g:
                 all_groups.add(g)
 
-        # Phase 2: Parallel file reads (collect all results first).
+        # Phase 1: Parallel file reads (collect all results first).
+        progress.start_phase("Reading", total_size)
         read_results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
             futures = [executor.submit(_read_file, fp) for fp, _ in file_entries]
             for (file_path, rel_path), future in zip(file_entries, futures):
                 content, mode, uid, gid, owner, group, mtime = future.result()
                 read_results.append((rel_path, content, mode, uid, gid, owner, group, mtime, file_path))
+                progress.update(rel_path, len(content))
 
-        # Phase 3: Serial HDF5 writes (no thread pool overhead, no require_group).
+        # Phase 2: Serial HDF5 writes.
+        progress.start_phase("Writing", total_size)
         with h5py.File(output_h5, file_mode) as h5fobj:
             for g in sorted(all_groups):
                 h5fobj.require_group(g)
@@ -581,7 +618,8 @@ def extract_h5_to_directory(h5_path, extract_dir, file_key=None, parallel=1,
                     total_bytes[0] += obj.nbytes
             h5tmp.visititems(size_counter)
 
-        progress = ProgressBar(total_bytes[0] if verbose else 0)
+        progress = ProgressBar(verbose)
+        progress.start_phase("Extracting", total_bytes[0])
         verbose_file = verbose and not progress.is_tty
 
         if parallel <= 1:
