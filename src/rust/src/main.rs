@@ -104,6 +104,10 @@ struct Cli {
     #[arg(long = "xattr")]
     xattr: bool,
 
+    /// Split archive into parts: SIZE (e.g. 100M) or n=COUNT (e.g. n=4). Implies --bagit.
+    #[arg(long = "split")]
+    split: Option<String>,
+
     /// Source directories/files (for -c/-r) or file key to extract (for -x)
     #[arg(trailing_var_arg = true)]
     path: Vec<String>,
@@ -145,8 +149,11 @@ fn main() {
     }
     let checksum = checksum_val.as_deref();
 
-    // --- BagIt mode ---
-    if cli.bagit {
+    // --split implies --bagit
+    let use_bagit = cli.bagit || cli.split.is_some();
+
+    // --- BagIt mode (with optional --split) ---
+    if use_bagit {
         let bs = har::bagit::parse_batch_size(&cli.batch_size);
 
         if cli.append {
@@ -160,11 +167,21 @@ fn main() {
                 std::process::exit(1);
             }
             let sources: Vec<&str> = cli.path.iter().map(|s| s.as_str()).collect();
-            har::bagit::pack_bagit(
-                &sources, &cli.file, compression, compression_opts,
-                cli.shuffle, bs, cli.parallel, cli.verbose, checksum, cli.xattr,
-                cli.validate,
-            );
+
+            if let Some(ref split_val) = cli.split {
+                let split_spec = har::bagit::parse_split_arg(split_val);
+                har::bagit::pack_bagit_split(
+                    &sources, &cli.file, compression, compression_opts,
+                    cli.shuffle, bs, cli.parallel, cli.verbose, checksum, cli.xattr,
+                    cli.validate, split_spec,
+                );
+            } else {
+                har::bagit::pack_bagit(
+                    &sources, &cli.file, compression, compression_opts,
+                    cli.shuffle, bs, cli.parallel, cli.verbose, checksum, cli.xattr,
+                    cli.validate,
+                );
+            }
             let validation_ok = if cli.validate_roundtrip {
                 let ok = har::validate_roundtrip(
                     &cli.file, &sources, true, cli.verbose, cli.byte_for_byte,
@@ -184,31 +201,58 @@ fn main() {
             }
         } else if cli.extract {
             let file_key = if cli.path.is_empty() { None } else { Some(cli.path[0].as_str()) };
-            har::bagit::extract_bagit(
-                &cli.file, &cli.directory, file_key,
-                cli.validate, cli.bagit_raw, cli.parallel, cli.verbose,
-                cli.metadata_json, cli.xattr,
-            );
+            if har::bagit::is_split_archive(&cli.file) {
+                har::bagit::extract_bagit_split(
+                    &cli.file, &cli.directory, file_key,
+                    cli.validate, cli.bagit_raw, cli.parallel, cli.verbose,
+                    cli.metadata_json, cli.xattr,
+                );
+            } else {
+                har::bagit::extract_bagit(
+                    &cli.file, &cli.directory, file_key,
+                    cli.validate, cli.bagit_raw, cli.parallel, cli.verbose,
+                    cli.metadata_json, cli.xattr,
+                );
+            }
         } else if cli.list {
-            har::bagit::list_bagit(&cli.file, cli.bagit_raw);
+            if har::bagit::is_split_archive(&cli.file) {
+                har::bagit::list_bagit_split(&cli.file, cli.bagit_raw);
+            } else {
+                har::bagit::list_bagit(&cli.file, cli.bagit_raw);
+            }
         }
         return;
     }
 
-    // --- Auto-detect bagit on extract/list ---
-    if (cli.extract || cli.list) && har::bagit::is_bagit_archive(&cli.file) {
-        eprintln!("Note: detected bagit-v1 archive, using BagIt extraction.");
-        if cli.extract {
-            let file_key = if cli.path.is_empty() { None } else { Some(cli.path[0].as_str()) };
-            har::bagit::extract_bagit(
-                &cli.file, &cli.directory, file_key,
-                cli.validate, cli.bagit_raw, cli.parallel, cli.verbose,
-                cli.metadata_json, cli.xattr,
-            );
-        } else {
-            har::bagit::list_bagit(&cli.file, cli.bagit_raw);
+    // --- Auto-detect split/bagit on extract/list ---
+    if cli.extract || cli.list {
+        if har::bagit::is_split_archive(&cli.file) {
+            eprintln!("Note: detected split bagit-v1 archive.");
+            if cli.extract {
+                let file_key = if cli.path.is_empty() { None } else { Some(cli.path[0].as_str()) };
+                har::bagit::extract_bagit_split(
+                    &cli.file, &cli.directory, file_key,
+                    cli.validate, cli.bagit_raw, cli.parallel, cli.verbose,
+                    cli.metadata_json, cli.xattr,
+                );
+            } else {
+                har::bagit::list_bagit_split(&cli.file, cli.bagit_raw);
+            }
+            return;
+        } else if har::bagit::is_bagit_archive(&cli.file) {
+            eprintln!("Note: detected bagit-v1 archive, using BagIt extraction.");
+            if cli.extract {
+                let file_key = if cli.path.is_empty() { None } else { Some(cli.path[0].as_str()) };
+                har::bagit::extract_bagit(
+                    &cli.file, &cli.directory, file_key,
+                    cli.validate, cli.bagit_raw, cli.parallel, cli.verbose,
+                    cli.metadata_json, cli.xattr,
+                );
+            } else {
+                har::bagit::list_bagit(&cli.file, cli.bagit_raw);
+            }
+            return;
         }
-        return;
     }
 
     // --- Legacy mode ---

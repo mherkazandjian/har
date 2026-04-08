@@ -468,6 +468,620 @@ impl Progress {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SplitProgress — thread-safe multi-split progress display
+// ---------------------------------------------------------------------------
+
+use std::sync::Mutex;
+
+struct SplitState {
+    label: String,
+    filename: String,
+    total_bytes: u64,
+    archived_bytes: u64,
+    recent_completed: VecDeque<(String, u64)>,
+    current_file: Option<(String, u64, u64)>, // (name, size, bytes_read)
+    queued_files: VecDeque<(String, u64)>,
+    finished: bool,
+}
+
+struct FileAggState {
+    total_size: u64,
+    chunk_count: u32,
+    chunks_done: u32,
+    bytes_hashed: u64,
+    active: bool,
+}
+
+struct SplitProgressInner {
+    is_tty: bool,
+    discovery_total_files: u64,
+    discovery_total_bytes: u64,
+    split_count: usize,
+    total_bytes: u64,
+    splits: Vec<SplitState>,
+    prev_lines: usize,
+    last_render: Instant,
+    validation_phase: bool,
+    // Global validation tracking (file-count + bytes)
+    validate_total_files: u64,
+    validate_done_files: u64,
+    validate_total_bytes: u64,
+    validate_done_bytes: u64,
+    validate_recent: VecDeque<(String, u64)>,  // (name, size)
+    // Multiple concurrent active files: slot -> (name, size, bytes_hashed) — fallback mode
+    validate_active: std::collections::BTreeMap<usize, (String, u64, u64)>,
+    validate_slot_counter: usize,
+    validate_loading: Option<(String, u64, u64)>,  // (split basename, total_bytes, bytes_read)
+    // File-level aggregation (for chunked files across splits)
+    validate_file_map: std::collections::HashMap<String, FileAggState>,
+    validate_slot_to_file: std::collections::HashMap<usize, String>,
+    validate_slot_progress: std::collections::HashMap<usize, u64>,
+}
+
+pub struct SplitProgress {
+    inner: Mutex<SplitProgressInner>,
+}
+
+impl SplitProgress {
+    pub fn new(verbose: bool, split_count: usize, split_sizes: &[u64], split_filenames: &[String]) -> Self {
+        let is_tty = io::stderr().is_terminal() && verbose;
+        let total_bytes: u64 = split_sizes.iter().sum();
+        let now = Instant::now();
+        let splits = (0..split_count)
+            .map(|i| SplitState {
+                label: format!("Split {}", i),
+                filename: split_filenames[i].clone(),
+                total_bytes: split_sizes[i],
+                archived_bytes: 0,
+                recent_completed: VecDeque::new(),
+                current_file: None,
+                queued_files: VecDeque::new(),
+                finished: false,
+            })
+            .collect();
+        SplitProgress {
+            inner: Mutex::new(SplitProgressInner {
+                is_tty,
+                discovery_total_files: 0,
+                discovery_total_bytes: total_bytes,
+                split_count,
+                total_bytes,
+                splits,
+                prev_lines: 0,
+                last_render: now,
+                validation_phase: false,
+                validate_total_files: 0,
+                validate_done_files: 0,
+                validate_total_bytes: 0,
+                validate_done_bytes: 0,
+                validate_recent: VecDeque::new(),
+                validate_active: std::collections::BTreeMap::new(),
+                validate_slot_counter: 0,
+                validate_loading: None,
+                validate_file_map: std::collections::HashMap::new(),
+                validate_slot_to_file: std::collections::HashMap::new(),
+                validate_slot_progress: std::collections::HashMap::new(),
+            }),
+        }
+    }
+
+    pub fn finish_discovery(&self, total_files: u64, total_bytes: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.discovery_total_files = total_files;
+        inner.discovery_total_bytes = total_bytes;
+        if inner.is_tty {
+            Self::render(&mut inner);
+        }
+    }
+
+    pub fn begin_file(&self, split_index: usize, rel_path: &str, file_size: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        let split = &mut inner.splits[split_index];
+        if let Some((prev_name, prev_size, _)) = split.current_file.take() {
+            split.recent_completed.push_back((prev_name, prev_size));
+            if split.recent_completed.len() > 2 {
+                split.recent_completed.pop_front();
+            }
+        }
+        split.current_file = Some((rel_path.to_string(), file_size, 0));
+        Self::maybe_render(&mut inner);
+    }
+
+    pub fn update_file_progress(&self, split_index: usize, bytes_read: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(ref mut cur) = inner.splits[split_index].current_file {
+            cur.2 = bytes_read;
+        }
+        Self::maybe_render(&mut inner);
+    }
+
+    pub fn finish_file(&self, split_index: usize, nbytes: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        let split = &mut inner.splits[split_index];
+        split.archived_bytes += nbytes;
+        // Move current file to recent_completed to avoid double-counting
+        // (archived_bytes already includes this file; keeping current_file
+        // would add its bytes_read again in the global progress sum)
+        if let Some((name, size, _)) = split.current_file.take() {
+            split.recent_completed.push_back((name, size));
+            if split.recent_completed.len() > 2 {
+                split.recent_completed.pop_front();
+            }
+        }
+        if inner.is_tty {
+            Self::render(&mut inner);
+        }
+    }
+
+    pub fn set_queued(&self, split_index: usize, files: &[(String, u64)]) {
+        let mut inner = self.inner.lock().unwrap();
+        let split = &mut inner.splits[split_index];
+        split.queued_files.clear();
+        for f in files.iter().take(3) {
+            split.queued_files.push_back(f.clone());
+        }
+    }
+
+    pub fn begin_validation_phase(
+        &self, total_files: u64, total_bytes: u64,
+        file_map: std::collections::HashMap<String, (u64, u32)>,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.validation_phase = true;
+        inner.validate_total_files = total_files;
+        inner.validate_done_files = 0;
+        inner.validate_total_bytes = total_bytes;
+        inner.validate_done_bytes = 0;
+        inner.validate_recent.clear();
+        inner.validate_active.clear();
+        inner.validate_slot_counter = 0;
+        inner.validate_loading = None;
+        inner.validate_file_map = file_map.into_iter().map(|(name, (total_size, chunk_count))| {
+            (name, FileAggState { total_size, chunk_count, chunks_done: 0, bytes_hashed: 0, active: false })
+        }).collect();
+        inner.validate_slot_to_file.clear();
+        inner.validate_slot_progress.clear();
+        if inner.is_tty {
+            Self::render(&mut inner);
+        }
+    }
+
+    /// Start validating a chunk. Returns a slot ID for progress updates.
+    pub fn validate_begin_file(&self, name: &str, size: u64) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let slot = inner.validate_slot_counter;
+        inner.validate_slot_counter += 1;
+        if inner.validate_file_map.contains_key(name) {
+            inner.validate_file_map.get_mut(name).unwrap().active = true;
+            inner.validate_slot_to_file.insert(slot, name.to_string());
+            inner.validate_slot_progress.insert(slot, 0);
+        } else {
+            inner.validate_active.insert(slot, (name.to_string(), size, 0));
+        }
+        Self::maybe_render(&mut inner);
+        slot
+    }
+
+    pub fn validate_update_progress(&self, slot: usize, bytes_hashed: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(file_name) = inner.validate_slot_to_file.get(&slot).cloned() {
+            let prev = inner.validate_slot_progress.get(&slot).copied().unwrap_or(0);
+            let delta = bytes_hashed.saturating_sub(prev);
+            inner.validate_slot_progress.insert(slot, bytes_hashed);
+            if let Some(state) = inner.validate_file_map.get_mut(&file_name) {
+                state.bytes_hashed += delta;
+            }
+        } else if let Some(entry) = inner.validate_active.get_mut(&slot) {
+            entry.2 = bytes_hashed;
+        }
+        Self::maybe_render(&mut inner);
+    }
+
+    pub fn validate_set_loading(&self, filename: &str, total_bytes: u64) {
+        let basename = std::path::Path::new(filename)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| filename.to_string());
+        let mut inner = self.inner.lock().unwrap();
+        inner.validate_loading = Some((basename, total_bytes, 0));
+        Self::maybe_render(&mut inner);
+    }
+
+    pub fn validate_update_loading(&self, bytes_read: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(ref mut loading) = inner.validate_loading {
+            loading.2 = bytes_read;
+        }
+        Self::maybe_render(&mut inner);
+    }
+
+    pub fn validate_clear_loading(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.validate_loading = None;
+        Self::maybe_render(&mut inner);
+    }
+
+    pub fn validate_finish_file(&self, slot: usize, nbytes: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(file_name) = inner.validate_slot_to_file.remove(&slot) {
+            let prev = inner.validate_slot_progress.remove(&slot).unwrap_or(0);
+            // Extract values before borrowing other fields
+            let mut file_done = false;
+            let mut file_total_size = 0u64;
+            if let Some(state) = inner.validate_file_map.get_mut(&file_name) {
+                state.bytes_hashed = state.bytes_hashed.saturating_sub(prev) + nbytes;
+                state.chunks_done += 1;
+                if state.chunks_done >= state.chunk_count {
+                    state.active = false;
+                    file_done = true;
+                    file_total_size = state.total_size;
+                }
+            }
+            if file_done {
+                inner.validate_done_files += 1;
+                inner.validate_done_bytes += file_total_size;
+                inner.validate_recent.push_back((file_name, file_total_size));
+                while inner.validate_recent.len() > 7 {
+                    inner.validate_recent.pop_front();
+                }
+            }
+        } else if let Some((name, size, _)) = inner.validate_active.remove(&slot) {
+            inner.validate_recent.push_back((name, size));
+            while inner.validate_recent.len() > 7 {
+                inner.validate_recent.pop_front();
+            }
+            inner.validate_done_files += 1;
+            inner.validate_done_bytes += nbytes;
+        }
+        if inner.is_tty {
+            Self::render(&mut inner);
+        }
+    }
+
+    pub fn finish_split(&self, split_index: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        let split = &mut inner.splits[split_index];
+        if let Some((name, size, _)) = split.current_file.take() {
+            split.recent_completed.push_back((name, size));
+        }
+        split.recent_completed.clear();
+        split.queued_files.clear();
+        split.finished = true;
+        if inner.is_tty {
+            Self::render(&mut inner);
+        }
+    }
+
+    pub fn finish(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        for split in &mut inner.splits {
+            split.finished = true;
+            split.current_file = None;
+            split.recent_completed.clear();
+            split.queued_files.clear();
+        }
+        if !inner.is_tty || inner.prev_lines == 0 {
+            return;
+        }
+        Self::render_final(&mut inner);
+    }
+
+    fn maybe_render(inner: &mut SplitProgressInner) {
+        if !inner.is_tty {
+            return;
+        }
+        let now = Instant::now();
+        if now.duration_since(inner.last_render) >= Duration::from_millis(50) {
+            Self::render(inner);
+            inner.last_render = now;
+        }
+    }
+
+    fn render(inner: &mut SplitProgressInner) {
+        let mut err = io::stderr().lock();
+        if inner.prev_lines > 0 {
+            write!(err, "\x1b[{}A", inner.prev_lines).ok();
+        }
+
+        let tw = term_width();
+        let bar_width: usize = if tw >= 100 { 40 } else if tw >= 60 { tw - 60 + 20 } else { 20 };
+        let name_max = tw.saturating_sub(10);
+        let mut lines: usize = 0;
+        let bar_full = "\u{2588}".repeat(bar_width);
+
+        // --- Discovery bar (always complete for split mode) ---
+        writeln!(err, "\x1b[2K\x1b[32m\u{2713}\x1b[0m {:12} [\x1b[32m{}\x1b[0m] 100.0% ({} files / {})",
+                 "Discovering", bar_full, inner.discovery_total_files,
+                 human_size_bytes(inner.discovery_total_bytes)).ok();
+        lines += 1;
+
+        const MAX_DETAIL_LINES: usize = 8;
+
+        if inner.validation_phase {
+            // === VALIDATION PHASE ===
+            // Archiving collapsed
+            writeln!(err, "\x1b[2K\x1b[32m\u{2713}\x1b[0m {:12} [\x1b[32m{}\x1b[0m] 100.0% ({}) — {} splits",
+                     "Archiving", bar_full, human_size_bytes(inner.total_bytes),
+                     inner.split_count).ok();
+            lines += 1;
+
+            // Global bytes-based validation bar (include partial hashing from active files)
+            let use_file_map = !inner.validate_file_map.is_empty();
+            let partial_hashed: u64 = if use_file_map {
+                inner.validate_file_map.values().filter(|s| s.active).map(|s| s.bytes_hashed).sum()
+            } else {
+                inner.validate_active.values().map(|(_, _, h)| *h).sum()
+            };
+            let v_bytes = (inner.validate_done_bytes + partial_hashed)
+                .min(inner.validate_total_bytes);
+            let v_total_bytes = inner.validate_total_bytes.max(1);
+            let v_pct = (v_bytes as f64 * 100.0 / v_total_bytes as f64).min(100.0);
+            let v_filled = ((bar_width as u64).saturating_mul(v_bytes) / v_total_bytes) as usize;
+            let v_filled = v_filled.min(bar_width);
+            let v_empty = bar_width - v_filled;
+            writeln!(err, "\x1b[2K  {:12} [{}{}] {:.1}% ({} / {}) — {}/{} files",
+                     "Validating",
+                     "\u{2588}".repeat(v_filled),
+                     "\u{2591}".repeat(v_empty),
+                     v_pct,
+                     human_size_bytes(v_bytes),
+                     human_size_bytes(inner.validate_total_bytes),
+                     inner.validate_done_files,
+                     inner.validate_total_files).ok();
+            lines += 1;
+
+            // Collect detail lines: recent completed + active files with per-file progress bars
+            let file_bar_width: usize = 20;
+            let mut detail: Vec<String> = Vec::new();
+            for (name, size) in &inner.validate_recent {
+                let bar_str = "\u{2588}".repeat(file_bar_width);
+                let suffix = format!("  ({})", human_size_bytes(*size));
+                let name_budget = name_max.saturating_sub(file_bar_width + 18 + suffix.len());
+                detail.push(format!("\x1b[2K    \x1b[32m\u{2713}\x1b[0m [\x1b[32m{}\x1b[0m] 100.0%  {}{}",
+                         bar_str,
+                         truncate_name(name, name_budget), suffix));
+            }
+            if use_file_map {
+                // File-level aggregated display
+                let mut active_files: Vec<(&String, &FileAggState)> = inner.validate_file_map.iter()
+                    .filter(|(_, state)| state.active)
+                    .collect();
+                active_files.sort_by_key(|(name, _)| (*name).clone());
+                for (name, state) in &active_files {
+                    let (file_pct, f_filled) = if state.total_size > 0 {
+                        let pct = (state.bytes_hashed as f64 * 100.0 / state.total_size as f64).min(100.0);
+                        let filled = ((file_bar_width as u64).saturating_mul(state.bytes_hashed) / state.total_size.max(1)) as usize;
+                        (pct, filled.min(file_bar_width))
+                    } else {
+                        (0.0, 0)
+                    };
+                    let f_empty = file_bar_width - f_filled;
+                    let suffix = format!("  ({})", human_size_bytes(state.total_size));
+                    let name_budget = name_max.saturating_sub(file_bar_width + 18 + suffix.len());
+                    detail.push(format!("\x1b[2K    \x1b[35m\u{25b8}\x1b[0m [{}{}] {:.1}%  {}{}",
+                             "\u{2588}".repeat(f_filled),
+                             "\u{2591}".repeat(f_empty),
+                             file_pct,
+                             truncate_name(name, name_budget), suffix));
+                }
+            } else {
+                // Fallback: per-slot display (non-split archives)
+                for (_, (name, size, hashed)) in &inner.validate_active {
+                    let (file_pct, f_filled) = if *size > 0 {
+                        let pct = (*hashed as f64 * 100.0 / *size as f64).min(100.0);
+                        let filled = ((file_bar_width as u64).saturating_mul(*hashed) / (*size).max(1)) as usize;
+                        (pct, filled.min(file_bar_width))
+                    } else {
+                        (0.0, 0)
+                    };
+                    let f_empty = file_bar_width - f_filled;
+                    let suffix = format!("  ({})", human_size_bytes(*size));
+                    let name_budget = name_max.saturating_sub(file_bar_width + 18 + suffix.len());
+                    detail.push(format!("\x1b[2K    \x1b[35m\u{25b8}\x1b[0m [{}{}] {:.1}%  {}{}",
+                             "\u{2588}".repeat(f_filled),
+                             "\u{2591}".repeat(f_empty),
+                             file_pct,
+                             truncate_name(name, name_budget), suffix));
+                }
+            }
+            if let Some((ref name, total, read)) = inner.validate_loading {
+                let (load_pct, l_filled) = if total > 0 {
+                    let pct = (read as f64 * 100.0 / total as f64).min(100.0);
+                    let filled = ((file_bar_width as u64).saturating_mul(read) / total.max(1)) as usize;
+                    (pct, filled.min(file_bar_width))
+                } else {
+                    (0.0, 0)
+                };
+                let l_empty = file_bar_width - l_filled;
+                let suffix = format!("  ({})", human_size_bytes(total));
+                let name_budget = name_max.saturating_sub(file_bar_width + 18 + suffix.len());
+                detail.push(format!("\x1b[2K    \x1b[2m\u{25cb}\x1b[0m \x1b[2m[{}{}] {:.1}%  {}{}  reading\x1b[0m",
+                         "\u{2588}".repeat(l_filled),
+                         "\u{2591}".repeat(l_empty),
+                         load_pct,
+                         truncate_name(name, name_budget), suffix));
+            }
+            let skip = detail.len().saturating_sub(MAX_DETAIL_LINES);
+            for line in detail.iter().skip(skip) {
+                writeln!(err, "{}", line).ok();
+                lines += 1;
+            }
+        } else {
+            // === ARCHIVING PHASE ===
+            // Global archiving bar
+            let global_archived: u64 = inner.splits.iter()
+                .map(|s| s.archived_bytes + s.current_file.as_ref().map(|c| c.2).unwrap_or(0))
+                .sum();
+            let global_total = inner.total_bytes.max(1);
+            let global_pct = (global_archived as f64 * 100.0 / global_total as f64).min(100.0);
+            let global_filled = ((bar_width as u64).saturating_mul(global_archived) / global_total) as usize;
+            let global_filled = global_filled.min(bar_width);
+            let global_empty = bar_width - global_filled;
+            if global_archived >= global_total {
+                writeln!(err, "\x1b[2K\x1b[32m\u{2713}\x1b[0m {:12} [\x1b[32m{}\x1b[0m] 100.0% ({}) — {} splits",
+                         "Archiving", bar_full, human_size_bytes(inner.total_bytes),
+                         inner.split_count).ok();
+            } else {
+                writeln!(err, "\x1b[2K  {:14} [{}{}] {:.1}% ({} / {}) — {} splits",
+                         "Archiving",
+                         "\u{2588}".repeat(global_filled),
+                         "\u{2591}".repeat(global_empty),
+                         global_pct,
+                         human_size_bytes(global_archived),
+                         human_size_bytes(inner.total_bytes),
+                         inner.split_count).ok();
+            }
+            lines += 1;
+
+            // Build detail lines per category: finished, active (has progress), pending (0%)
+            let mut finished_lines: Vec<String> = Vec::new();
+            let mut active_lines: Vec<String> = Vec::new();
+            let mut pending_lines: Vec<String> = Vec::new();
+
+            for split in &inner.splits {
+                if split.finished {
+                    let total_h = human_size_bytes(split.total_bytes);
+                    finished_lines.push(format!("\x1b[2K  \x1b[32m\u{2713}\x1b[0m {:10} [\x1b[32m{}\x1b[0m] 100.0% ({})  {}",
+                             split.label, bar_full, total_h,
+                             truncate_name(&split.filename, name_max)));
+                } else {
+                    let effective = (split.archived_bytes
+                        + split.current_file.as_ref().map(|c| c.2).unwrap_or(0))
+                        .min(split.total_bytes);
+                    let total = split.total_bytes.max(1);
+                    let pct = (effective as f64 * 100.0 / total as f64).min(100.0);
+                    let filled = ((bar_width as u64).saturating_mul(effective) / total) as usize;
+                    let filled = filled.min(bar_width);
+                    let empty = bar_width - filled;
+
+                    let is_active = effective > 0 || split.current_file.is_some();
+                    let target = if is_active { &mut active_lines } else { &mut pending_lines };
+
+                    target.push(format!("\x1b[2K    {:10} [{}{}] {:.1}% ({} / {})  {}",
+                             split.label,
+                             "\u{2588}".repeat(filled),
+                             "\u{2591}".repeat(empty),
+                             pct,
+                             human_size_bytes(effective),
+                             human_size_bytes(split.total_bytes),
+                             truncate_name(&split.filename, name_max)));
+
+                    if is_active {
+                        for (name, size) in &split.recent_completed {
+                            let size_str = human_size_bytes(*size);
+                            let suffix = format!("  ({})", size_str);
+                            target.push(format!("\x1b[2K      \x1b[32m\u{2713} {}{}\x1b[0m",
+                                     truncate_name(name, name_max.saturating_sub(suffix.len() + 6)), suffix));
+                        }
+                        if let Some((ref name, size, bytes_read)) = split.current_file {
+                            let size_str = human_size_bytes(size);
+                            if size > 0 && bytes_read < size {
+                                let pct = bytes_read as f64 * 100.0 / size as f64;
+                                let suffix = format!("  {:.1}% ({})", pct, size_str);
+                                target.push(format!("\x1b[2K      \x1b[35m\u{25b8} {}{}\x1b[0m",
+                                         truncate_name(name, name_max.saturating_sub(suffix.len() + 6)), suffix));
+                            } else {
+                                let suffix = format!("  ({})", size_str);
+                                target.push(format!("\x1b[2K      \x1b[35m\u{25b8} {}{}\x1b[0m",
+                                         truncate_name(name, name_max.saturating_sub(suffix.len() + 6)), suffix));
+                            }
+                        }
+                        for (name, size) in &split.queued_files {
+                            let size_str = human_size_bytes(*size);
+                            let suffix = format!("  ({})", size_str);
+                            target.push(format!("\x1b[2K      \x1b[90m\u{25cb} {}{}\x1b[0m",
+                                     truncate_name(name, name_max.saturating_sub(suffix.len() + 6)), suffix));
+                        }
+                    }
+                }
+            }
+
+            // Priority: active lines always shown, then fill remaining with
+            // finished (tail) and pending (head) if space allows
+            let active_count = active_lines.len();
+            let remaining = MAX_DETAIL_LINES.saturating_sub(active_count);
+            // Give finished lines half the remaining (tail), pending the other half (head)
+            let finished_budget = remaining / 2;
+            let pending_budget = remaining.saturating_sub(finished_budget);
+            let f_skip = finished_lines.len().saturating_sub(finished_budget);
+            let p_take = pending_budget.min(pending_lines.len());
+
+            for line in finished_lines.iter().skip(f_skip) {
+                writeln!(err, "{}", line).ok();
+                lines += 1;
+            }
+            for line in &active_lines {
+                writeln!(err, "{}", line).ok();
+                lines += 1;
+            }
+            for line in pending_lines.iter().take(p_take) {
+                writeln!(err, "{}", line).ok();
+                lines += 1;
+            }
+        }
+
+        // Clear leftover lines from previous render
+        let prev = inner.prev_lines;
+        for _ in 0..prev.saturating_sub(lines) {
+            writeln!(err, "\x1b[2K").ok();
+        }
+        let extra = prev.saturating_sub(lines);
+        if extra > 0 {
+            write!(err, "\x1b[{}A", extra).ok();
+        }
+
+        inner.prev_lines = lines;
+        err.flush().ok();
+    }
+
+    fn render_final(inner: &mut SplitProgressInner) {
+        let mut err = io::stderr().lock();
+        if inner.prev_lines > 0 {
+            write!(err, "\x1b[{}A", inner.prev_lines).ok();
+        }
+
+        let tw = term_width();
+        let bar_width: usize = if tw >= 100 { 40 } else if tw >= 60 { tw - 60 + 20 } else { 20 };
+        let bar_full = "\u{2588}".repeat(bar_width);
+        let mut lines: usize = 0;
+
+        // Discovery complete
+        writeln!(err, "\x1b[2K\x1b[32m\u{2713}\x1b[0m {:12} [\x1b[32m{}\x1b[0m] 100.0% ({} files / {})",
+                 "Discovering", bar_full, inner.discovery_total_files,
+                 human_size_bytes(inner.discovery_total_bytes)).ok();
+        lines += 1;
+
+        // Archiving complete
+        writeln!(err, "\x1b[2K\x1b[32m\u{2713}\x1b[0m {:12} [\x1b[32m{}\x1b[0m] 100.0% ({}) — {} splits",
+                 "Archiving", bar_full, human_size_bytes(inner.total_bytes),
+                 inner.split_count).ok();
+        lines += 1;
+
+        // Validating complete (if validation was done)
+        if inner.validation_phase {
+            writeln!(err, "\x1b[2K\x1b[32m\u{2713}\x1b[0m {:12} [\x1b[32m{}\x1b[0m] 100.0% ({} / {}) — {} files",
+                     "Validating", bar_full,
+                     human_size_bytes(inner.validate_total_bytes),
+                     human_size_bytes(inner.validate_total_bytes),
+                     inner.validate_total_files).ok();
+            lines += 1;
+        }
+
+        // Clear leftover
+        for _ in 0..inner.prev_lines.saturating_sub(lines) {
+            writeln!(err, "\x1b[2K").ok();
+        }
+        let extra = inner.prev_lines.saturating_sub(lines);
+        if extra > 0 {
+            write!(err, "\x1b[{}A", extra).ok();
+        }
+
+        err.flush().ok();
+        inner.prev_lines = 0;
+    }
+}
+
 /// Compress data with LZMA.
 pub fn lzma_compress(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
