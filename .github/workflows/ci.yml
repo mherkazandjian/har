@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-python:
+    name: Lint Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile-check Python sources
+        run: |
+          python3 -m py_compile src/har.py
+          python3 -m py_compile src/har_bagit.py
+
+  lint-rust:
+    name: Lint Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install HDF5
+        run: sudo apt-get update && sudo apt-get install -y libhdf5-dev pkg-config cmake
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/rust/target
+          key: rust-clippy-${{ hashFiles('src/rust/Cargo.lock') }}
+          restore-keys: rust-clippy-
+
+      - name: Clippy
+        working-directory: src/rust
+        run: cargo clippy -- -D warnings
+
+  test-python:
+    name: Test Python
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          pip install h5py numpy pytest
+          pip install .
+
+      - name: Run Python tests
+        run: python -m pytest tests/test_h5.py tests/test_bagit.py -v
+
+  test-rust:
+    name: Test Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install HDF5
+        run: sudo apt-get update && sudo apt-get install -y libhdf5-dev pkg-config cmake
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/rust/target
+          key: rust-test-${{ hashFiles('src/rust/Cargo.lock') }}
+          restore-keys: rust-test-
+
+      - name: Run Rust tests
+        working-directory: src/rust
+        run: cargo test
+
+  build-rust-static:
+    name: Build static binary
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.86-alpine
+    steps:
+      - name: Install build dependencies
+        run: apk add --no-cache bash git hdf5-dev hdf5-static musl-dev pkgconf cmake make perl zlib-static
+
+      - uses: actions/checkout@v4
+
+      - name: Add musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/rust/target
+          key: musl-cargo-${{ hashFiles('src/rust/Cargo.lock') }}
+          restore-keys: musl-cargo-
+
+      - name: Build static binary
+        working-directory: src/rust
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cargo build --features static-hdf5 --release --target x86_64-unknown-linux-musl
+
+      - name: Run tests (static)
+        working-directory: src/rust
+        run: cargo test --features static-hdf5 --target x86_64-unknown-linux-musl
+
+      - name: Verify binary
+        run: src/rust/target/x86_64-unknown-linux-musl/release/har --version
