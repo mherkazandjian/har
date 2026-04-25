@@ -147,7 +147,7 @@ clean:
 test: test-python test-rust
 
 test-python:
-	python -m pytest tests/test_h5.py tests/test_bagit.py
+	python -m pytest tests/test_h5.py tests/test_bagit.py tests/test_ecc.py tests/test_mpi_regressions.py tests/test_cross_impl.py
 
 test-bagit:
 	python -m pytest tests/test_bagit.py -v
@@ -260,6 +260,8 @@ lint-rust: $(NEED_DYNAMIC_ENV)
 lint-python:
 	python3 -m py_compile src/har.py
 	python3 -m py_compile src/har_bagit.py
+	python3 -m py_compile src/har_ecc.py
+	python3 -m py_compile src/har_mpi.py
 
 clean-rust:
 	rm -rf $(RUST_DIR)/target $(RUST_DIR)/.cargo_home $(RUST_DIR)/.rustup_home

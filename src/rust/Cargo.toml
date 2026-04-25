@@ -28,10 +28,12 @@ ndarray = "0.15"
 ratatui = "0.29"
 crossterm = "0.28"
 users = "0.11"
+reed-solomon-erasure = "6"
+crc32c = "0.6"
+tempfile = "3"
 
 [features]
 default = []
 static-hdf5 = ["hdf5/static", "hdf5/zlib"]
 
 [dev-dependencies]
-tempfile = "3"

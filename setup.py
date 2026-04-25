@@ -12,6 +12,7 @@ setup(
     ],
     extras_require={
         'mpi': ['mpi4py>=3.0'],
+        'ecc': ['zfec>=1.0'],
     },
     entry_points={
         'console_scripts': [

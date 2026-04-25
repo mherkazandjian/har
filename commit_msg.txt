@@ -1,0 +1,21 @@
+add reed-solomon ecc self-healing archives
+
+wrap finished .h5 files with reed-solomon erasure coding (gf(2^8)) to
+protect everything — hdf5 superblock, b-trees, metadata, and payload —
+against bitrot and corruption. parity blocks are uniformly distributed
+from offset 0 to eof with cross-stripe interleaving for burst-error
+resilience.
+
+new files: src/har_ecc.py, src/rust/src/ecc.rs, tests/test_ecc.py,
+tests/test_cross_impl.py, tests/test_mpi_regressions.py
+
+cli flags: --ecc, --heal, --ecc-info, --ecc-map, --ecc-verify,
+--ecc-wrap, --ecc-unwrap. --ecc implies --bagit. bare numbers accepted
+as percentages (e.g. --ecc 90 = --ecc 90%). auto-unwrap on extract,
+list, and browse.
+
+rust uses reed-solomon-erasure crate, python uses zfec. container
+format is shared but parity bytes are not cross-compatible between
+implementations (different rs matrix conventions).
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>

@@ -122,6 +122,17 @@ def test_list_contents(test_env):
     list_bagit(test_env['archive_path'])
 
 
+def test_list_bagit_raw_no_double_data_prefix(test_env, capsys):
+    # Regression: --bagit-raw -t used to prepend another `data/` onto paths
+    # that are already stored as `data/<rel>`, giving `data/data/<rel>`.
+    pack_bagit([test_env['src_dir']], test_env['archive_path'])
+    list_bagit(test_env['archive_path'], bagit_raw=True)
+    out = capsys.readouterr().out
+    assert 'data/data/' not in out, f"double data/ prefix leaked:\n{out}"
+    # The expected bagit-style path must still appear.
+    assert 'data/src/file1.txt' in out
+
+
 def test_validate_pass(test_env):
     pack_bagit([test_env['src_dir']], test_env['archive_path'])
     extract_bagit(test_env['archive_path'], test_env['extract_dir'], validate=True)

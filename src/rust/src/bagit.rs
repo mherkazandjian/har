@@ -69,6 +69,130 @@ pub(crate) struct IndexRecord {
 }
 
 // ---------------------------------------------------------------------------
+// Dual-format BagIt index reader
+// ---------------------------------------------------------------------------
+//
+// Two on-disk layouts are accepted:
+//   /index         — Python's compound-dtype dataset (single record per file)
+//   /index_data/   — Rust's parallel-array group (one dataset per field)
+//
+// Writers remain divergent for now; only readers are tolerant.
+
+#[derive(hdf5::H5Type, Clone)]
+#[repr(C)]
+struct CompoundIndexEntryV2 {
+    path: hdf5::types::FixedAscii<4096>,
+    batch_id: u32,
+    offset: u64,
+    length: u64,
+    mode: u32,
+    sha256: hdf5::types::FixedAscii<64>,
+    uid: u32,
+    gid: u32,
+    mtime: f64,
+    owner: hdf5::types::FixedAscii<256>,
+    group_name: hdf5::types::FixedAscii<256>,
+}
+
+#[derive(hdf5::H5Type, Clone)]
+#[repr(C)]
+struct CompoundIndexEntryV1 {
+    path: hdf5::types::FixedAscii<4096>,
+    batch_id: u32,
+    offset: u64,
+    length: u64,
+    mode: u32,
+    sha256: hdf5::types::FixedAscii<64>,
+}
+
+pub(crate) struct BagitIndex {
+    pub count: usize,
+    pub paths: Vec<String>,
+    pub batch_ids: Vec<u32>,
+    pub offsets: Vec<u64>,
+    pub lengths: Vec<u64>,
+    pub modes: Vec<u32>,
+    pub sha256s: Vec<String>,
+    pub chunk_offsets: Vec<u64>,
+}
+
+fn split_blob(blob: Vec<u8>, expected: usize) -> Vec<String> {
+    let s = String::from_utf8(blob).unwrap_or_default();
+    let mut parts: Vec<String> = s.split('\n').map(|p| p.to_string()).collect();
+    // Trim a single empty trailing element emitted by writers that
+    // terminate the blob with '\n'.
+    if parts.len() == expected + 1 && parts.last().is_some_and(|s| s.is_empty()) {
+        parts.pop();
+    }
+    parts
+}
+
+pub(crate) fn load_bagit_index(h5: &hdf5::File) -> BagitIndex {
+    if let Ok(idx) = h5.group("index_data") {
+        // Native Rust layout: parallel arrays.
+        let count = idx.attr("count").unwrap().read_scalar::<u64>().unwrap() as usize;
+        let batch_ids: Vec<u32> = idx.dataset("batch_id").unwrap().read_raw().unwrap();
+        let offsets: Vec<u64> = idx.dataset("offset").unwrap().read_raw().unwrap();
+        let lengths: Vec<u64> = idx.dataset("length").unwrap().read_raw().unwrap();
+        let modes: Vec<u32> = idx.dataset("mode").unwrap().read_raw().unwrap();
+        let paths_blob: Vec<u8> = idx.dataset("paths").unwrap().read_raw().unwrap();
+        let shas_blob: Vec<u8> = idx.dataset("sha256s").unwrap().read_raw().unwrap();
+        let chunk_offsets: Vec<u64> = idx.dataset("chunk_offset").ok()
+            .map(|ds| ds.read_raw().unwrap())
+            .unwrap_or_else(|| vec![0u64; count]);
+        BagitIndex {
+            count,
+            paths: split_blob(paths_blob, count),
+            batch_ids,
+            offsets,
+            lengths,
+            modes,
+            sha256s: split_blob(shas_blob, count),
+            chunk_offsets,
+        }
+    } else if let Ok(ds) = h5.dataset("index") {
+        // Python compound layout. Try the modern schema (with uid/gid/mtime/
+        // owner/group_name) first, then fall back to the v1 schema.
+        type CompoundCols = (Vec<String>, Vec<u32>, Vec<u64>, Vec<u64>, Vec<u32>, Vec<String>);
+        let cols: CompoundCols = if let Ok(rows) = ds.read_raw::<CompoundIndexEntryV2>() {
+            (
+                rows.iter().map(|r| r.path.as_str().to_string()).collect(),
+                rows.iter().map(|r| r.batch_id).collect(),
+                rows.iter().map(|r| r.offset).collect(),
+                rows.iter().map(|r| r.length).collect(),
+                rows.iter().map(|r| r.mode).collect(),
+                rows.iter().map(|r| r.sha256.as_str().to_string()).collect(),
+            )
+        } else if let Ok(rows) = ds.read_raw::<CompoundIndexEntryV1>() {
+            (
+                rows.iter().map(|r| r.path.as_str().to_string()).collect(),
+                rows.iter().map(|r| r.batch_id).collect(),
+                rows.iter().map(|r| r.offset).collect(),
+                rows.iter().map(|r| r.length).collect(),
+                rows.iter().map(|r| r.mode).collect(),
+                rows.iter().map(|r| r.sha256.as_str().to_string()).collect(),
+            )
+        } else {
+            panic!("Unrecognized compound /index schema");
+        };
+        let (paths, batch_ids, offsets, lengths, modes, sha256s) = cols;
+        let count = paths.len();
+        BagitIndex {
+            count,
+            paths,
+            batch_ids,
+            offsets,
+            lengths,
+            modes,
+            sha256s,
+            chunk_offsets: vec![0u64; count],
+        }
+    } else {
+        panic!("No BagIt index found (neither /index nor /index_data/ present)");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -752,52 +876,33 @@ pub fn pack_bagit(
 
     // 5. Write index, manifests, empty_dirs, user_metadata
 
-    // Index — parallel arrays
-    let idx_grp = h5f.create_group("index_data").unwrap();
-
-    let paths_data: Vec<String> = index_records.iter().map(|r| r.bagit_path.clone()).collect();
-    let batch_ids: Vec<u32> = index_records.iter().map(|r| r.batch_id).collect();
-    let offsets: Vec<u64> = index_records.iter().map(|r| r.offset).collect();
-    let lengths: Vec<u64> = index_records.iter().map(|r| r.length).collect();
-    let modes: Vec<u32> = index_records.iter().map(|r| r.mode).collect();
-    let shas: Vec<String> = index_records.iter().map(|r| r.sha256.clone()).collect();
-    let uids: Vec<u32> = index_records.iter().map(|r| r.uid).collect();
-    let gids: Vec<u32> = index_records.iter().map(|r| r.gid).collect();
-    let mtimes: Vec<f64> = index_records.iter().map(|r| r.mtime).collect();
-    let owners: Vec<String> = index_records.iter().map(|r| r.owner.clone()).collect();
-    let groups: Vec<String> = index_records.iter().map(|r| r.group.clone()).collect();
-
-    idx_grp.new_dataset::<u32>().shape(batch_ids.len()).create("batch_id").unwrap()
-        .write_raw(&batch_ids).unwrap();
-    idx_grp.new_dataset::<u64>().shape(offsets.len()).create("offset").unwrap()
-        .write_raw(&offsets).unwrap();
-    idx_grp.new_dataset::<u64>().shape(lengths.len()).create("length").unwrap()
-        .write_raw(&lengths).unwrap();
-    idx_grp.new_dataset::<u32>().shape(modes.len()).create("mode").unwrap()
-        .write_raw(&modes).unwrap();
-
-    let paths_blob = paths_data.join("\n").into_bytes();
-    idx_grp.new_dataset::<u8>().shape(paths_blob.len()).create("paths").unwrap()
-        .write_raw(&paths_blob).unwrap();
-    let shas_blob = shas.join("\n").into_bytes();
-    idx_grp.new_dataset::<u8>().shape(shas_blob.len()).create("sha256s").unwrap()
-        .write_raw(&shas_blob).unwrap();
-
-    idx_grp.new_dataset::<u32>().shape(uids.len()).create("uid").unwrap()
-        .write_raw(&uids).unwrap();
-    idx_grp.new_dataset::<u32>().shape(gids.len()).create("gid").unwrap()
-        .write_raw(&gids).unwrap();
-    idx_grp.new_dataset::<f64>().shape(mtimes.len()).create("mtime").unwrap()
-        .write_raw(&mtimes).unwrap();
-    let owners_blob = owners.join("\n").into_bytes();
-    idx_grp.new_dataset::<u8>().shape(owners_blob.len()).create("owners").unwrap()
-        .write_raw(&owners_blob).unwrap();
-    let groups_blob = groups.join("\n").into_bytes();
-    idx_grp.new_dataset::<u8>().shape(groups_blob.len()).create("groups").unwrap()
-        .write_raw(&groups_blob).unwrap();
-
-    idx_grp.new_attr::<u64>().shape(()).create("count").unwrap()
-        .write_scalar(&(file_count as u64)).unwrap();
+    // Index — compound-dtype dataset at /index (matches Python's INDEX_DTYPE
+    // layout so archives are byte-compatible at the index level). Split
+    // archives (pack_single_split) still use /index_data/ because they need
+    // the chunk_offset column, which the compound schema does not carry.
+    let compound_rows: Vec<CompoundIndexEntryV2> = index_records.iter().map(|r| {
+        CompoundIndexEntryV2 {
+            path: hdf5::types::FixedAscii::from_ascii(r.bagit_path.as_bytes())
+                .expect("path exceeds 4096 bytes or is not ASCII"),
+            batch_id: r.batch_id,
+            offset: r.offset,
+            length: r.length,
+            mode: r.mode,
+            sha256: hdf5::types::FixedAscii::from_ascii(r.sha256.as_bytes())
+                .expect("sha256 is not 64 ASCII bytes"),
+            uid: r.uid,
+            gid: r.gid,
+            mtime: r.mtime,
+            owner: hdf5::types::FixedAscii::from_ascii(r.owner.as_bytes())
+                .expect("owner exceeds 256 bytes or is not ASCII"),
+            group_name: hdf5::types::FixedAscii::from_ascii(r.group.as_bytes())
+                .expect("group exceeds 256 bytes or is not ASCII"),
+        }
+    }).collect();
+    h5f.new_dataset::<CompoundIndexEntryV2>()
+        .shape(compound_rows.len())
+        .create("index").unwrap()
+        .write_raw(&compound_rows).unwrap();
 
     // BagIt tag files
     let manifest_name = format!("manifest-{}.txt", hash_algo);
@@ -841,28 +946,19 @@ pub fn pack_bagit(
         progress.enable_validation(total_size);
         let h5v = hdf5::File::open(&output_h5)
             .unwrap_or_else(|e| panic!("Failed to reopen '{}' for validation: {}", output_h5, e));
-        let idx = h5v.group("index_data").expect("Missing index_data group");
-        let count_v = idx.attr("count").unwrap().read_scalar::<u64>().unwrap() as usize;
-        let v_batch_ids: Vec<u32> = idx.dataset("batch_id").unwrap().read_raw().unwrap();
-        let v_offsets: Vec<u64> = idx.dataset("offset").unwrap().read_raw().unwrap();
-        let v_lengths: Vec<u64> = idx.dataset("length").unwrap().read_raw().unwrap();
-        let v_paths_blob: Vec<u8> = idx.dataset("paths").unwrap().read_raw().unwrap();
-        let v_shas_blob: Vec<u8> = idx.dataset("sha256s").unwrap().read_raw().unwrap();
-        let v_paths_str = String::from_utf8(v_paths_blob).unwrap();
-        let v_paths: Vec<&str> = v_paths_str.split('\n').collect();
-        let v_shas_str = String::from_utf8(v_shas_blob).unwrap();
-        let v_shas: Vec<&str> = v_shas_str.split('\n').collect();
+        let vi = load_bagit_index(&h5v);
 
         let mut val_errors: Vec<String> = Vec::new();
         // Cache for LZMA batches only (must decompress entire batch)
         let mut lzma_cache: std::collections::BTreeMap<u32, Vec<u8>> = std::collections::BTreeMap::new();
-        for i in 0..count_v {
-            let bid = v_batch_ids[i];
-            let display_name = v_paths[i].strip_prefix("data/").unwrap_or(v_paths[i]);
+        for i in 0..vi.count {
+            let bid = vi.batch_ids[i];
+            let path_str = vi.paths[i].as_str();
+            let display_name = path_str.strip_prefix("data/").unwrap_or(path_str);
             progress.begin_validation(display_name);
 
-            let off = v_offsets[i] as usize;
-            let len = v_lengths[i] as usize;
+            let off = vi.offsets[i] as usize;
+            let len = vi.lengths[i] as usize;
             let ds = h5v.dataset(&format!("batches/{}", bid)).unwrap();
 
             let is_batch_lzma = ds.attr("har_lzma").ok()
@@ -877,8 +973,8 @@ pub fn pack_bagit(
                 });
                 let file_bytes = &batch_data[off..off + len];
                 let actual = crate::compute_checksum(file_bytes, hash_algo);
-                if actual != v_shas[i] {
-                    val_errors.push(v_paths[i].to_string());
+                if actual != vi.sha256s[i] {
+                    val_errors.push(vi.paths[i].clone());
                 }
                 progress.finish_validation_file(len as u64);
             } else {
@@ -896,8 +992,8 @@ pub fn pack_bagit(
                     progress.finish_validation_file(chunk_len as u64);
                 }
                 let actual = hasher.finalize_hex();
-                if actual != v_shas[i] {
-                    val_errors.push(v_paths[i].to_string());
+                if actual != vi.sha256s[i] {
+                    val_errors.push(vi.paths[i].clone());
                 }
             }
         }
@@ -975,25 +1071,16 @@ pub fn extract_bagit(
         .map(|v| v.as_str().to_string())
         .unwrap_or_else(|| "sha256".to_string());
 
-    // Read index arrays
-    let idx = h5f.group("index_data").expect("Missing index_data group");
-    let count = idx.attr("count").unwrap().read_scalar::<u64>().unwrap() as usize;
-    let batch_ids: Vec<u32> = idx.dataset("batch_id").unwrap().read_raw().unwrap();
-    let offsets: Vec<u64> = idx.dataset("offset").unwrap().read_raw().unwrap();
-    let lengths: Vec<u64> = idx.dataset("length").unwrap().read_raw().unwrap();
-    let modes: Vec<u32> = idx.dataset("mode").unwrap().read_raw().unwrap();
-    let paths_blob: Vec<u8> = idx.dataset("paths").unwrap().read_raw().unwrap();
-    let shas_blob: Vec<u8> = idx.dataset("sha256s").unwrap().read_raw().unwrap();
-    // Read chunk_offsets if present (for chunked file support)
-    let chunk_offsets: Vec<u64> = idx.dataset("chunk_offset")
-        .ok()
-        .map(|ds| ds.read_raw().unwrap())
-        .unwrap_or_else(|| vec![0u64; count]);
-
-    let paths_str = String::from_utf8(paths_blob).unwrap();
-    let paths: Vec<&str> = paths_str.split('\n').collect();
-    let shas_str = String::from_utf8(shas_blob).unwrap();
-    let shas: Vec<&str> = shas_str.split('\n').collect();
+    // Read index (auto-detects Python compound vs Rust parallel-array layout).
+    let bi = load_bagit_index(&h5f);
+    let count = bi.count;
+    let batch_ids = &bi.batch_ids;
+    let offsets = &bi.offsets;
+    let lengths = &bi.lengths;
+    let modes = &bi.modes;
+    let chunk_offsets = &bi.chunk_offsets;
+    let paths: Vec<&str> = bi.paths.iter().map(|s| s.as_str()).collect();
+    let shas: Vec<&str> = bi.sha256s.iter().map(|s| s.as_str()).collect();
 
     // Single-file extraction
     if let Some(key) = file_key {
@@ -1019,7 +1106,7 @@ pub fn extract_bagit(
             // Write all chunks (sorted by chunk_offset)
             {
                 use std::io::Seek;
-                let mut outfile = fs::OpenOptions::new().create(true).write(true).open(&dest).unwrap();
+                let mut outfile = fs::OpenOptions::new().create(true).truncate(false).write(true).open(&dest).unwrap();
                 for &ci in &matching_indices {
                     let bid = batch_ids[ci];
                     let off = offsets[ci] as usize;
@@ -1132,7 +1219,7 @@ pub fn extract_bagit(
                 if co > 0 {
                     // Chunked file: open existing (or create) and seek to chunk offset
                     use std::io::Seek;
-                    let mut outfile = fs::OpenOptions::new().create(true).write(true).open(&dest).unwrap();
+                    let mut outfile = fs::OpenOptions::new().create(true).truncate(false).write(true).open(&dest).unwrap();
                     outfile.seek(std::io::SeekFrom::Start(co)).unwrap();
                     outfile.write_all(file_bytes).unwrap();
                 } else {
@@ -1181,7 +1268,7 @@ pub fn extract_bagit(
                     if let Some(p) = dest.parent() { fs::create_dir_all(p).ok(); }
                     if co > 0 {
                         use std::io::Seek;
-                        let mut outfile = fs::OpenOptions::new().create(true).write(true).open(&dest).unwrap();
+                        let mut outfile = fs::OpenOptions::new().create(true).truncate(false).write(true).open(&dest).unwrap();
                         outfile.seek(std::io::SeekFrom::Start(co)).unwrap();
                         outfile.write_all(file_bytes).unwrap();
                     } else {
@@ -1297,14 +1384,11 @@ pub fn list_bagit(h5_path: &str, bagit_raw: bool) {
         }
     }
 
-    let idx = h5f.group("index_data").expect("Missing index_data group");
-    let paths_blob: Vec<u8> = idx.dataset("paths").unwrap().read_raw().unwrap();
-    let paths_str = String::from_utf8(paths_blob).unwrap();
-    let mut paths: Vec<String> = if bagit_raw {
-        paths_str.split('\n').map(|p| format!("data/{}", p)).collect()
-    } else {
-        paths_str.split('\n').map(|p| p.to_string()).collect()
-    };
+    let bi = load_bagit_index(&h5f);
+    // Stored paths are already in BagIt form (`data/<rel>`). Raw mode shows
+    // them as-is alongside the tag files; normal mode also shows the stored
+    // path for backward compatibility.
+    let mut paths: Vec<String> = bi.paths.clone();
     paths.sort();
 
     let total = paths.len() + tag_files.len();
@@ -1666,6 +1750,7 @@ struct ValidationTask {
 
 /// Scan all split indexes (metadata only, no batch data). Build one ValidationTask
 /// per logical file and a file_map for progress display.
+#[allow(clippy::type_complexity)]
 fn build_validation_tasks(
     split_count: usize, split_paths: &[String],
 ) -> (Vec<ValidationTask>, std::collections::HashMap<String, (u64, u32)>, u64, u64) {
@@ -1673,36 +1758,27 @@ fn build_validation_tasks(
     let mut tasks_map: std::collections::HashMap<String, ValidationTask> =
         std::collections::HashMap::new();
 
-    for si in 0..split_count {
-        let h5 = hdf5::File::open(&split_paths[si])
-            .unwrap_or_else(|e| panic!("Failed to open '{}' for index scan: {}", split_paths[si], e));
-        let idx = h5.group("index_data").expect("Missing index_data group");
-        let count = idx.attr("count").unwrap().read_scalar::<u64>().unwrap() as usize;
-        let batch_ids: Vec<u32> = idx.dataset("batch_id").unwrap().read_raw().unwrap();
-        let offsets: Vec<u64> = idx.dataset("offset").unwrap().read_raw().unwrap();
-        let lengths: Vec<u64> = idx.dataset("length").unwrap().read_raw().unwrap();
-        let paths_blob: Vec<u8> = idx.dataset("paths").unwrap().read_raw().unwrap();
-        let shas_blob: Vec<u8> = idx.dataset("sha256s").unwrap().read_raw().unwrap();
-        let paths_str = String::from_utf8(paths_blob).unwrap();
-        let paths: Vec<&str> = paths_str.split('\n').collect();
-        let shas_str = String::from_utf8(shas_blob).unwrap();
-        let shas: Vec<&str> = shas_str.split('\n').collect();
+    for (si, split_path) in split_paths.iter().enumerate().take(split_count) {
+        let h5 = hdf5::File::open(split_path)
+            .unwrap_or_else(|e| panic!("Failed to open '{}' for index scan: {}", split_path, e));
+        let bi = load_bagit_index(&h5);
 
-        for i in 0..count {
-            let display_name = paths[i].strip_prefix("data/").unwrap_or(paths[i]).to_string();
+        for i in 0..bi.count {
+            let path = &bi.paths[i];
+            let display_name = path.strip_prefix("data/").unwrap_or(path).to_string();
             let task = tasks_map.entry(display_name.clone()).or_insert_with(|| ValidationTask {
                 display_name: display_name.clone(),
                 total_size: 0,
                 chunks: Vec::new(),
             });
-            task.total_size += lengths[i];
+            task.total_size += bi.lengths[i];
             task.chunks.push(ChunkInfo {
                 split_index: si,
-                batch_id: batch_ids[i],
-                offset: offsets[i],
-                length: lengths[i],
-                expected_sha: shas[i].to_string(),
-                bagit_path: paths[i].to_string(),
+                batch_id: bi.batch_ids[i],
+                offset: bi.offsets[i],
+                length: bi.lengths[i],
+                expected_sha: bi.sha256s[i].clone(),
+                bagit_path: path.clone(),
             });
         }
     }
@@ -1759,7 +1835,7 @@ fn validate_splits_parallel(
             let failed_ref = &failed;
             workers.push(s.spawn(move || {
                 loop {
-                    let task = match { rx.lock().unwrap().recv() } {
+                    let task = match rx.lock().unwrap().recv() {
                         Ok(t) => t,
                         Err(_) => break,
                     };

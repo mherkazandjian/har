@@ -108,6 +108,35 @@ struct Cli {
     #[arg(long = "split")]
     split: Option<String>,
 
+    /// Add Reed-Solomon ECC protection to archive: low, medium, high, max, or N%
+    #[arg(long = "ecc")]
+    ecc: Option<String>,
+
+    /// Heal (repair in place) an ECC-wrapped archive
+    #[arg(long = "heal", group = "operation")]
+    heal: bool,
+
+    /// Print ECC container info for an ECC-wrapped archive
+    #[arg(long = "ecc-info", group = "operation")]
+    ecc_info: bool,
+
+    /// Print visual block map of an ECC-wrapped archive
+    #[arg(long = "ecc-map", group = "operation")]
+    ecc_map: bool,
+
+    /// Verify ECC-wrapped archive integrity (no writes)
+    #[arg(long = "ecc-verify", group = "operation")]
+    ecc_verify: bool,
+
+    /// Wrap an existing .h5 file with ECC protection (takes level: low/medium/high/max/N%)
+    /// Can be used standalone or combined with -c to wrap after creation.
+    #[arg(long = "ecc-wrap")]
+    ecc_wrap: Option<String>,
+
+    /// Unwrap an ECC-wrapped archive back to a plain .h5 file
+    #[arg(long = "ecc-unwrap", group = "operation")]
+    ecc_unwrap: bool,
+
     /// Source directories/files (for -c/-r) or file key to extract (for -x)
     #[arg(trailing_var_arg = true)]
     path: Vec<String>,
@@ -120,6 +149,113 @@ fn main() {
         eprintln!("Error: --parallel must be >= 1.");
         std::process::exit(1);
     }
+
+    // --- Standalone ECC operations ---
+    if cli.ecc_info {
+        match har::ecc::ecc_info(std::path::Path::new(&cli.file)) {
+            Ok(()) => return,
+            Err(e) => { eprintln!("ecc-info: {}", e); std::process::exit(1); }
+        }
+    }
+    if cli.ecc_map {
+        match har::ecc::ecc_map(std::path::Path::new(&cli.file)) {
+            Ok(()) => return,
+            Err(e) => { eprintln!("ecc-map: {}", e); std::process::exit(1); }
+        }
+    }
+    if cli.ecc_verify {
+        match har::ecc::ecc_verify(std::path::Path::new(&cli.file), cli.verbose) {
+            Ok(r) => {
+                println!(
+                    "ECC verify: {} stripes, {} blocks, {} corrupt, {} unrepairable stripes, hash_ok={}",
+                    r.n_stripes, r.total_blocks, r.corrupt_blocks,
+                    r.unrepairable_stripes.len(), r.hash_ok
+                );
+                if r.corrupt_blocks == 0 && r.unrepairable_stripes.is_empty() && r.hash_ok {
+                    return;
+                } else {
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => { eprintln!("ecc-verify: {}", e); std::process::exit(1); }
+        }
+    }
+    if cli.ecc_wrap.is_some() && !cli.create && !cli.append && !cli.extract && !cli.list && !cli.browse {
+        let level = cli.ecc_wrap.as_ref().unwrap();
+        let params = match har::ecc::parse_ecc_level(level) {
+            Ok(p) => p,
+            Err(e) => { eprintln!("ecc-wrap: {}", e); std::process::exit(1); }
+        };
+        let input = std::path::PathBuf::from(&cli.file);
+        let tmp = std::path::PathBuf::from(format!("{}.ecc.tmp", cli.file));
+        match har::ecc::ecc_wrap(&input, &tmp, params, cli.verbose) {
+            Ok(()) => {
+                std::fs::rename(&tmp, &input).expect("rename");
+                println!("ECC wrap complete: {}", cli.file);
+                return;
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                eprintln!("ecc-wrap: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+    if cli.ecc_unwrap {
+        let input = std::path::PathBuf::from(&cli.file);
+        let tmp = std::path::PathBuf::from(format!("{}.unwrap.tmp", cli.file));
+        match har::ecc::ecc_unwrap(&input, &tmp, cli.verbose) {
+            Ok(()) => {
+                std::fs::rename(&tmp, &input).expect("rename");
+                println!("ECC unwrap complete: {}", cli.file);
+                return;
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                eprintln!("ecc-unwrap: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+    if cli.heal {
+        match har::ecc::ecc_repair(std::path::Path::new(&cli.file), cli.verbose) {
+            Ok(r) => {
+                println!(
+                    "Heal: {} corrupt blocks found, {} unrepairable stripes, hash_ok={}",
+                    r.corrupt_blocks, r.unrepairable_stripes.len(), r.hash_ok
+                );
+                if r.unrepairable_stripes.is_empty() { return; } else { std::process::exit(1); }
+            }
+            Err(e) => { eprintln!("heal: {}", e); std::process::exit(1); }
+        }
+    }
+
+    // --- Auto-detect ECC wrapper on extract/list/browse: unwrap to temp file ---
+    // We keep the tempfile alive for the remainder of main() so that the
+    // downstream HDF5 open can read from it.
+    let mut _ecc_tmp_guard: Option<tempfile::NamedTempFile> = None;
+    let mut working_file = cli.file.clone();
+    if (cli.extract || cli.list || cli.browse) && har::ecc::is_ecc_wrapped(std::path::Path::new(&cli.file)) {
+        eprintln!("Note: detected ECC-wrapped archive, unwrapping to temp file.");
+        let tmp = tempfile::Builder::new()
+            .prefix("har_ecc_")
+            .suffix(".h5")
+            .tempfile()
+            .expect("create temp file");
+        if let Err(e) = har::ecc::ecc_unwrap(
+            std::path::Path::new(&cli.file), tmp.path(), cli.verbose
+        ) {
+            eprintln!("ECC unwrap failed: {}", e);
+            std::process::exit(1);
+        }
+        working_file = tmp.path().to_string_lossy().into_owned();
+        _ecc_tmp_guard = Some(tmp);
+    }
+    let cli = {
+        let mut c = cli;
+        c.file = working_file;
+        c
+    };
 
     // --- Browse mode ---
     if cli.browse {
@@ -150,7 +286,7 @@ fn main() {
     let checksum = checksum_val.as_deref();
 
     // --split implies --bagit
-    let use_bagit = cli.bagit || cli.split.is_some();
+    let use_bagit = cli.bagit || cli.split.is_some() || cli.ecc.is_some();
 
     // --- BagIt mode (with optional --split) ---
     if use_bagit {
@@ -197,6 +333,28 @@ fn main() {
                     har::delete_source_files(&sources, cli.verbose);
                 } else {
                     eprintln!("Skipping source deletion: validation failed.");
+                }
+            }
+            let ecc_level = cli.ecc.as_ref().or(cli.ecc_wrap.as_ref());
+            if let Some(level) = ecc_level {
+                if cli.split.is_some() {
+                    eprintln!("Error: --ecc/--ecc-wrap is not supported with --split yet.");
+                    std::process::exit(1);
+                }
+                let params = match har::ecc::parse_ecc_level(level) {
+                    Ok(p) => p,
+                    Err(e) => { eprintln!("--ecc-wrap: {}", e); std::process::exit(1); }
+                };
+                let input = std::path::PathBuf::from(&cli.file);
+                let tmp = std::path::PathBuf::from(format!("{}.ecc.tmp", cli.file));
+                if let Err(e) = har::ecc::ecc_wrap(&input, &tmp, params, cli.verbose) {
+                    let _ = std::fs::remove_file(&tmp);
+                    eprintln!("ECC wrap: {}", e);
+                    std::process::exit(1);
+                }
+                std::fs::rename(&tmp, &input).expect("rename");
+                if cli.verbose {
+                    println!("ECC wrap complete: {}", cli.file);
                 }
             }
         } else if cli.extract {
@@ -284,6 +442,21 @@ fn main() {
                 eprintln!("Skipping source deletion: validation failed.");
             }
         }
+        if let Some(level) = cli.ecc_wrap.as_ref() {
+            let params = match har::ecc::parse_ecc_level(level) {
+                Ok(p) => p,
+                Err(e) => { eprintln!("--ecc-wrap: {}", e); std::process::exit(1); }
+            };
+            let input = std::path::PathBuf::from(&cli.file);
+            let tmp = std::path::PathBuf::from(format!("{}.ecc.tmp", cli.file));
+            if let Err(e) = har::ecc::ecc_wrap(&input, &tmp, params, cli.verbose) {
+                let _ = std::fs::remove_file(&tmp);
+                eprintln!("ECC wrap: {}", e);
+                std::process::exit(1);
+            }
+            std::fs::rename(&tmp, &input).expect("rename");
+            if cli.verbose { println!("ECC wrap complete: {}", cli.file); }
+        }
     } else if cli.append {
         if cli.path.is_empty() {
             eprintln!("Error: At least one source (directory or file) is required for appending (-r).");
@@ -311,6 +484,21 @@ fn main() {
             } else {
                 eprintln!("Skipping source deletion: validation failed.");
             }
+        }
+        if let Some(level) = cli.ecc_wrap.as_ref() {
+            let params = match har::ecc::parse_ecc_level(level) {
+                Ok(p) => p,
+                Err(e) => { eprintln!("--ecc-wrap: {}", e); std::process::exit(1); }
+            };
+            let input = std::path::PathBuf::from(&cli.file);
+            let tmp = std::path::PathBuf::from(format!("{}.ecc.tmp", cli.file));
+            if let Err(e) = har::ecc::ecc_wrap(&input, &tmp, params, cli.verbose) {
+                let _ = std::fs::remove_file(&tmp);
+                eprintln!("ECC wrap: {}", e);
+                std::process::exit(1);
+            }
+            std::fs::rename(&tmp, &input).expect("rename");
+            if cli.verbose { println!("ECC wrap complete: {}", cli.file); }
         }
     } else if cli.extract {
         let file_key = if cli.path.is_empty() { None } else { Some(cli.path[0].as_str()) };

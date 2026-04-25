@@ -867,7 +867,7 @@ impl SplitProgress {
                 }
             } else {
                 // Fallback: per-slot display (non-split archives)
-                for (_, (name, size, hashed)) in &inner.validate_active {
+                for (name, size, hashed) in inner.validate_active.values() {
                     let (file_pct, f_filled) = if *size > 0 {
                         let pct = (*hashed as f64 * 100.0 / *size as f64).min(100.0);
                         let filled = ((file_bar_width as u64).saturating_mul(*hashed) / (*size).max(1)) as usize;
@@ -2476,6 +2476,7 @@ pub fn delete_source_files(sources: &[&str], verbose: bool) {
 pub mod bagit;
 pub mod metadata;
 pub mod browse;
+pub mod ecc;
 
 #[cfg(test)]
 mod tests;

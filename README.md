@@ -6,9 +6,14 @@ per-file metadata, and indexed random access.
 
 ## Advantages over tar
 
+- **Dynamic append** — add files to an existing archive without rewriting it.
+  Compressed tar archives (`.tar.gz`, `.tar.bz2`, `.tar.xz`) **cannot be
+  appended to**: the compression stream must be fully decompressed and
+  rewritten, so adding one file to a 1 TB `.tar.gz` costs a full 1 TB read +
+  write. `har -rf archive.h5 newdir` writes only the new files and their
+  index entries, regardless of archive size, with or without compression.
 - **Parallel I/O** — read and write files concurrently with `-p N`
 - **Indexed access** — extract a single file without scanning the entire archive
-- **Dynamic append** — add files to an existing archive without rewriting it
 - **Per-file metadata** — file permissions are stored and restored automatically
 - **Smaller archives** — HDF5 format has less overhead than tar for many small files
   (35% smaller on 100k files without compression)
@@ -151,7 +156,8 @@ index dataset instead of 100k datasets.
 ```
 / (root)
   @har_format = "bagit-v1"
-  /index          — compound dataset (path, batch_id, offset, length, mode, sha256)
+  /index          — compound dataset (path, batch_id, offset, length, mode,
+                    sha256, uid, gid, mtime, owner, group_name)
   /batches/0      — uint8 dataset (concatenated file bytes, ~64 MB)
   /batches/1
   ...
@@ -162,6 +168,12 @@ index dataset instead of 100k datasets.
     tagmanifest-sha256.txt
   /empty_dirs     — empty directory paths
 ```
+
+Plain `--bagit` archives use the same compound `/index` layout across Python
+and Rust and are byte-compatible at the index level. Split archives
+(`--split`, Rust-only) use a `/index_data/` parallel-array group instead
+because they carry an extra `chunk_offset` column. Both readers accept
+either layout.
 
 ### Usage
 
@@ -211,6 +223,108 @@ har --bagit -tf archive.h5
 - On extraction, the `data/` BagIt prefix is stripped by default so the
   original directory tree is reproduced exactly. Use `--bagit-raw` to get
   the full BagIt directory with tag files.
+
+## ECC self-healing archives (`--ecc`)
+
+Archives can be protected against bitrot and corruption using Reed-Solomon
+erasure coding. The `--ecc` flag wraps the finished `.h5` file in a
+self-describing container with parity blocks distributed **uniformly** from
+offset 0 to EOF — protecting everything, including HDF5 superblock, B-trees,
+and metadata.
+
+### How it works
+
+The finished `.h5` file is treated as an opaque byte stream:
+
+1. **Split** into fixed-size blocks (64 KB), grouped into stripes
+2. **Encode** each stripe with Reed-Solomon (GF(2^8)), producing parity blocks
+3. **Interleave** data and parity blocks uniformly across the file, with
+   cross-stripe interleaving so that contiguous damage spreads across many
+   independently-recoverable stripes
+4. **Wrap** everything in a container with magic bytes (`\x89HARECC\n`),
+   CRC32C per block, BLAKE3 whole-file hash, and triple-redundant global headers
+
+On extraction, har auto-detects the ECC wrapper and transparently unwraps
+before opening the HDF5 content.
+
+### ECC levels
+
+| Level    | Correctable | Storage overhead | Description           |
+|----------|-------------|------------------|-----------------------|
+| `low`    | ~5%         | ~5.6%            | Light protection      |
+| `medium` | ~10%        | ~11.8%           | Recommended default   |
+| `high`   | ~20%        | ~26.8%           | High-value data       |
+| `max`    | ~33%        | ~49.6%           | Maximum resilience    |
+| `N%`     | ~N%         | varies           | Custom (e.g. `15%`)   |
+
+"Correctable" means the fraction of blocks per stripe that can be lost and
+still fully reconstructed.
+
+### Usage
+
+```sh
+# create a BagIt archive with ECC protection (--ecc implies --bagit)
+har --ecc medium -cf archive.h5 mydir
+
+# create with custom ECC percentage
+har --ecc 15% -cf archive.h5 mydir
+
+# extract (auto-detects ECC wrapper, unwraps transparently)
+har -xf archive.h5 -C output/
+
+# check integrity without modifying
+har --ecc-verify -f archive.h5
+
+# repair corrupted blocks in place
+har --heal -f archive.h5
+
+# show ECC container parameters
+har --ecc-info -f archive.h5
+
+# wrap an existing .h5 file with ECC protection
+har --ecc-wrap medium -f archive.h5
+
+# remove ECC wrapper, leaving plain .h5
+har --ecc-unwrap -f archive.h5
+```
+
+### ECC-specific flags
+
+| Flag | Description |
+|------|-------------|
+| `--ecc LEVEL` | Add ECC protection on creation (implies `--bagit`) |
+| `--ecc-info` | Print ECC container parameters |
+| `--ecc-verify` | Verify block integrity (no writes) |
+| `--heal` | Detect and repair corrupted blocks in place |
+| `--ecc-wrap LEVEL` | Wrap an existing .h5 file with ECC |
+| `--ecc-unwrap` | Remove ECC wrapper from a file |
+
+### Design highlights
+
+- **Byte-level, below HDF5**: ECC wraps the entire file as opaque bytes.
+  HDF5 superblock, B-trees, dataset headers — everything is protected.
+- **Uniform parity distribution**: parity blocks are placed at mathematically
+  uniform positions across the whole file (Bresenham-like), not clustered at
+  the start or end.
+- **Cross-stripe interleaving**: consecutive physical blocks belong to
+  different stripes, so a contiguous bad region (e.g. bad sectors) loses at
+  most one block per stripe, and each stripe recovers independently.
+- **Triple-redundant headers**: the global header is stored at the start and
+  twice at the end of the file, so even header corruption is recoverable.
+- **Self-describing blocks**: each block has magic bytes, CRC32C, stripe ID,
+  and block index — the file can be reconstructed by scanning blocks even if
+  the global header is destroyed.
+
+### Notes
+
+- The wrapped file is **not directly openable as HDF5** — it starts with
+  `\x89HARECC\n` instead of `\x89HDF\r\n\x1a\n`. Use `har --ecc-unwrap` or
+  let `har -xf` auto-detect and unwrap transparently.
+- `--ecc` combined with `--split` is not yet supported.
+- Python uses `zfec` and Rust uses `reed-solomon-erasure` — the container
+  format is identical but parity bytes are not cross-compatible between
+  implementations. Each tool can read its own archives. The `--ecc-info`
+  command shows which generator produced the archive.
 
 ## MPI parallel HDF5 I/O (`--mpi`) — experimental
 

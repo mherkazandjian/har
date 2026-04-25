@@ -18,8 +18,8 @@ import numpy as np
 from har_bagit import (
     build_inventory, parse_batch_size, HAR_FORMAT_ATTR, HAR_FORMAT_VALUE,
     HAR_VERSION_ATTR, HAR_VERSION_VALUE, INDEX_DTYPE, DEFAULT_BATCH_SIZE,
-    _human_size, _sha256_bytes, _generate_bagit_txt, _generate_bag_info,
-    _generate_manifest, _generate_tagmanifest,
+    _human_size, _checksum_bytes, _generate_bagit_txt, _generate_bag_info,
+    _generate_manifest, _generate_tagmanifest, _read_index,
 )
 
 
@@ -222,7 +222,7 @@ def mpi_extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
 
     h5f = h5py.File(h5_path, 'r', driver='mpio', comm=comm)
 
-    index = h5f['index'][()]
+    index = _read_index(h5f)
 
     empty_dirs = []
     if 'empty_dirs' in h5f:
@@ -257,7 +257,7 @@ def mpi_extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
                 fout.write(file_bytes)
             if mode:
                 os.chmod(dest, mode)
-            if validate and _sha256_bytes(file_bytes) != sha:
+            if validate and _checksum_bytes(file_bytes, 'sha256') != sha:
                 print(f"CHECKSUM MISMATCH: {out_path}", file=sys.stderr)
                 sys.exit(1)
             print("Extraction complete!")
@@ -291,7 +291,7 @@ def mpi_extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
                 fout.write(file_bytes)
             if mode:
                 os.chmod(dest, mode)
-            if validate and _sha256_bytes(file_bytes) != sha:
+            if validate and _checksum_bytes(file_bytes, 'sha256') != sha:
                 errors.append(out_path)
 
     comm.Barrier()

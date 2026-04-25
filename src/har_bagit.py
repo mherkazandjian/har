@@ -230,6 +230,49 @@ def is_split_archive(h5_path):
         return False
 
 
+def _read_index(h5f):
+    """Load the BagIt index as an INDEX_DTYPE compound array.
+
+    Accepts both layouts in the wild:
+      - /index         — this implementation's compound-dtype dataset
+      - /index_data/   — the Rust implementation's parallel-array group
+
+    Returns a structured numpy array with the INDEX_DTYPE fields so downstream
+    record-access code (rec['path'], rec['batch_id'], ...) is format-agnostic.
+    """
+    if 'index' in h5f:
+        return h5f['index'][()]
+    g = h5f['index_data']
+    count = int(g.attrs['count'])
+    idx = np.zeros(count, dtype=INDEX_DTYPE)
+    if count == 0:
+        return idx
+    idx['batch_id'] = g['batch_id'][()]
+    idx['offset']   = g['offset'][()]
+    idx['length']   = g['length'][()]
+    idx['mode']     = g['mode'][()]
+    idx['uid']      = g['uid'][()]
+    idx['gid']      = g['gid'][()]
+    idx['mtime']    = g['mtime'][()]
+
+    def _split_blob(name, expected):
+        parts = bytes(g[name][()]).split(b'\n')
+        # A trailing '\n' (if the writer emitted one) yields an empty tail;
+        # accept count exactly or count+1 with a blank last element.
+        if len(parts) == expected + 1 and parts[-1] == b'':
+            parts = parts[:expected]
+        if len(parts) != expected:
+            raise ValueError(
+                f"index_data/{name}: got {len(parts)} entries, expected {expected}")
+        return parts
+
+    idx['path']       = _split_blob('paths', count)
+    idx['sha256']     = _split_blob('sha256s', count)
+    idx['owner']      = _split_blob('owners', count)
+    idx['group_name'] = _split_blob('groups', count)
+    return idx
+
+
 # ---------------------------------------------------------------------------
 # Split helpers
 # ---------------------------------------------------------------------------
@@ -560,7 +603,7 @@ def pack_bagit(sources, output_h5, compression=None, compression_opts=None,
     if validate:
         errors = []
         with h5py.File(output_h5, 'r') as h5v:
-            v_index = h5v['index'][()]
+            v_index = _read_index(h5v)
             for rec in v_index:
                 batch_id = int(rec['batch_id'])
                 offset = int(rec['offset'])
@@ -735,7 +778,7 @@ def _pack_single_split(split_index, file_entries, output_path, split_count,
     if validate:
         errors = []
         with h5py.File(output_path, 'r') as h5v:
-            v_index = h5v['index'][()]
+            v_index = _read_index(h5v)
             for rec in v_index:
                 batch_id = int(rec['batch_id'])
                 offset = int(rec['offset'])
@@ -1051,7 +1094,7 @@ def extract_bagit(h5_path, extract_dir, file_key=None, validate=False,
                 pass
 
         # Read index
-        index = h5f['index'][()]
+        index = _read_index(h5f)
 
         # Read empty dirs
         empty_dirs = []
@@ -1291,11 +1334,11 @@ def list_bagit(h5_path, bagit_raw=False):
         if bagit_raw and 'bagit' in h5f:
             tag_files = sorted(h5f['bagit'].keys())
 
-        index = h5f['index'][()]
-        if bagit_raw:
-            paths = sorted('data/' + rec['path'].decode('utf-8') for rec in index)
-        else:
-            paths = sorted(rec['path'].decode('utf-8') for rec in index)
+        index = _read_index(h5f)
+        # Stored paths are already in BagIt form (`data/<rel>`). Raw mode
+        # shows them as-is alongside the tag files; normal mode also shows
+        # the stored path for backward compatibility.
+        paths = sorted(rec['path'].decode('utf-8') for rec in index)
 
         total = len(paths) + len(tag_files)
         print(f"Contents of {h5_path} ({total} entries)")

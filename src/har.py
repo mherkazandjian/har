@@ -754,6 +754,14 @@ def main():
     group.add_argument("-x", action="store_true", help="Extract from an archive.")
     group.add_argument("-t", action="store_true", help="List contents of an archive.")
     group.add_argument("-b", "--browse", action="store_true", help="Browse archive interactively (TUI).")
+    group.add_argument("--heal", action="store_true", help="Repair an ECC-wrapped archive in place.")
+    group.add_argument("--ecc-info", action="store_true", help="Print ECC container info.")
+    group.add_argument("--ecc-map", action="store_true", help="Print visual ECC block map.")
+    group.add_argument("--ecc-verify", action="store_true", help="Verify ECC-wrapped archive integrity.")
+    parser.add_argument("--ecc-wrap", type=str, default=None, metavar="LEVEL",
+                        help="Wrap file with ECC (low/medium/high/max/N%%). "
+                             "Standalone or combined with -c to wrap after creation.")
+    group.add_argument("--ecc-unwrap", action="store_true", help="Unwrap ECC-wrapped archive to plain .h5.")
 
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbosely list files processed.")
 
@@ -812,6 +820,10 @@ def main():
     parser.add_argument("--mpi", action="store_true",
                         help="Use MPI parallel HDF5 I/O (requires mpirun, mpi4py, parallel h5py).")
 
+    # ECC protection.
+    parser.add_argument("--ecc", type=str, default=None, metavar="LEVEL",
+                        help="Add Reed-Solomon ECC protection (low/medium/high/max/N%%). Implies --bagit.")
+
     # Split mode.
     parser.add_argument("--split", type=str, default=None,
                         help="Split archive into multiple files (implies --bagit). "
@@ -831,6 +843,66 @@ def main():
     if args.parallel < 1:
         print("Error: --parallel must be >= 1.", file=sys.stderr)
         sys.exit(1)
+
+    # --- Standalone ECC operations ---
+    _has_op = args.c or args.r or args.x or args.t or getattr(args, 'browse', False)
+    if args.ecc_info or args.ecc_map or args.ecc_verify or (args.ecc_wrap and not _has_op) or args.ecc_unwrap or args.heal:
+        from har_ecc import (is_ecc_wrapped, ecc_info, ecc_map, ecc_verify,
+                             ecc_unwrap, ecc_wrap, ecc_repair, parse_ecc_level)
+        h5_file = args.file
+        if args.ecc_info:
+            ecc_info(h5_file)
+            return
+        if args.ecc_map:
+            ecc_map(h5_file)
+            return
+        if args.ecc_verify:
+            r = ecc_verify(h5_file, verbose=args.verbose)
+            print(f"ECC verify: {r['n_stripes']} stripes, {r['total_blocks']} blocks, "
+                  f"{r['corrupt_blocks']} corrupt, "
+                  f"{len(r['unrepairable_stripes'])} unrepairable, hash_ok={r['hash_ok']}")
+            if r['corrupt_blocks'] == 0 and not r['unrepairable_stripes'] and r['hash_ok']:
+                return
+            sys.exit(1)
+        if args.ecc_wrap:
+            params = parse_ecc_level(args.ecc_wrap)
+            tmp = h5_file + '.ecc.tmp'
+            ecc_wrap(h5_file, tmp, params, verbose=args.verbose)
+            os.rename(tmp, h5_file)
+            print(f"ECC wrap complete: {h5_file}")
+            return
+        if args.ecc_unwrap:
+            tmp = h5_file + '.unwrap.tmp'
+            ecc_unwrap(h5_file, tmp, verbose=args.verbose)
+            os.rename(tmp, h5_file)
+            print(f"ECC unwrap complete: {h5_file}")
+            return
+        if args.heal:
+            r = ecc_repair(h5_file, verbose=args.verbose)
+            print(f"Heal: {r['corrupt_blocks']} corrupt blocks, "
+                  f"{len(r['unrepairable_stripes'])} unrepairable, hash_ok={r['hash_ok']}")
+            if r['unrepairable_stripes']:
+                sys.exit(1)
+            return
+
+    # --- Auto-detect ECC wrapper on extract/list/browse ---
+    h5_file_orig = args.file
+    _ecc_tmp = None
+    if args.x or args.t or args.browse:
+        from har_ecc import is_ecc_wrapped
+        if is_ecc_wrapped(args.file):
+            import tempfile
+            from har_ecc import ecc_unwrap
+            print("Note: detected ECC-wrapped archive, unwrapping to temp file.",
+                  file=sys.stderr)
+            _ecc_tmp = tempfile.NamedTemporaryFile(prefix='har_ecc_', suffix='.h5',
+                                                    delete=True)
+            ecc_unwrap(args.file, _ecc_tmp.name, verbose=args.verbose)
+            args.file = _ecc_tmp.name
+
+    # --ecc implies --bagit (--ecc-wrap does NOT — it wraps whatever mode produced)
+    if args.ecc:
+        args.bagit = True
 
     # --split implies --bagit
     if args.split:
@@ -892,6 +964,8 @@ def main():
                                pack_bagit_split, is_split_archive,
                                extract_bagit_split, list_bagit_split)
 
+        bs = parse_batch_size(args.batch_size)
+
         if args.mpi:
             from har_mpi import mpi_pack_bagit, mpi_extract_bagit, mpi_list_bagit
 
@@ -922,8 +996,6 @@ def main():
             print("Error: Append (-r) is not supported with --bagit "
                   "(manifests include checksums of all files).", file=sys.stderr)
             sys.exit(1)
-
-        bs = parse_batch_size(args.batch_size)
 
         if args.c:
             if not sources:
@@ -970,6 +1042,19 @@ def main():
                 else:
                     print("Skipping source deletion: validation failed.",
                           file=sys.stderr)
+            _ecc_level = args.ecc or args.ecc_wrap
+            if _ecc_level:
+                if args.split:
+                    print("Error: --ecc/--ecc-wrap is not supported with --split yet.",
+                          file=sys.stderr)
+                    sys.exit(1)
+                from har_ecc import ecc_wrap as _ecc_wrap, parse_ecc_level as _parse_ecc
+                _params = _parse_ecc(_ecc_level)
+                _tmp = h5_file + '.ecc.tmp'
+                _ecc_wrap(h5_file, _tmp, _params, verbose=args.verbose)
+                os.rename(_tmp, h5_file)
+                if args.verbose:
+                    print(f"ECC wrap complete: {h5_file}")
         elif args.x:
             file_key = sources[0] if sources else None
             # Auto-detect split archive
@@ -1081,6 +1166,14 @@ def main():
             else:
                 print("Skipping source deletion: validation failed.",
                       file=sys.stderr)
+        if args.ecc_wrap:
+            from har_ecc import ecc_wrap as _ecc_wrap, parse_ecc_level as _parse_ecc
+            _params = _parse_ecc(args.ecc_wrap)
+            _tmp = h5_file + '.ecc.tmp'
+            _ecc_wrap(h5_file, _tmp, _params, verbose=args.verbose)
+            os.rename(_tmp, h5_file)
+            if args.verbose:
+                print(f"ECC wrap complete: {h5_file}")
     elif args.r:
         # Append to archive.
         if not sources:
@@ -1112,6 +1205,14 @@ def main():
             else:
                 print("Skipping source deletion: validation failed.",
                       file=sys.stderr)
+        if args.ecc_wrap:
+            from har_ecc import ecc_wrap as _ecc_wrap, parse_ecc_level as _parse_ecc
+            _params = _parse_ecc(args.ecc_wrap)
+            _tmp = h5_file + '.ecc.tmp'
+            _ecc_wrap(h5_file, _tmp, _params, verbose=args.verbose)
+            os.rename(_tmp, h5_file)
+            if args.verbose:
+                print(f"ECC wrap complete: {h5_file}")
     elif args.x:
         file_key = sources[0] if sources else None
         extract_h5_to_directory(h5_file, target_dir, file_key=file_key,

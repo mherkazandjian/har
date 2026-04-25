@@ -21,6 +21,8 @@ jobs:
         run: |
           python3 -m py_compile src/har.py
           python3 -m py_compile src/har_bagit.py
+          python3 -m py_compile src/har_ecc.py
+          python3 -m py_compile src/har_mpi.py
 
   lint-rust:
     name: Lint Rust
@@ -63,11 +65,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install h5py numpy pytest
+          pip install h5py numpy pytest zfec blake3
           pip install .
 
       - name: Run Python tests
-        run: python -m pytest tests/test_h5.py tests/test_bagit.py -v
+        run: python -m pytest tests/test_h5.py tests/test_bagit.py tests/test_ecc.py tests/test_mpi_regressions.py -v
 
   test-rust:
     name: Test Rust
