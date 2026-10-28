@@ -1167,12 +1167,8 @@ fn read_file(path: &Path) -> io::Result<FileData> {
     let gid = meta.gid();
     let mtime = meta.modified()?.duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default().as_secs_f64();
-    let owner = users::get_user_by_uid(uid)
-        .map(|u| u.name().to_string_lossy().to_string())
-        .unwrap_or_else(|| uid.to_string());
-    let group = users::get_group_by_gid(gid)
-        .map(|g| g.name().to_string_lossy().to_string())
-        .unwrap_or_else(|| gid.to_string());
+    let owner = user_name(uid);
+    let group = group_name(gid);
     Ok(FileData { content, mode, uid, gid, owner, group, mtime })
 }
 
@@ -1191,12 +1187,8 @@ where
     let gid = meta.gid();
     let mtime = meta.modified()?.duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default().as_secs_f64();
-    let owner = users::get_user_by_uid(uid)
-        .map(|u| u.name().to_string_lossy().to_string())
-        .unwrap_or_else(|| uid.to_string());
-    let group = users::get_group_by_gid(gid)
-        .map(|g| g.name().to_string_lossy().to_string())
-        .unwrap_or_else(|| gid.to_string());
+    let owner = user_name(uid);
+    let group = group_name(gid);
 
     let mut content = Vec::with_capacity(file_size);
     let mut file = fs::File::open(path)?;
@@ -1450,6 +1442,35 @@ pub(crate) struct FileMeta {
     pub(crate) mtime: f64,
 }
 
+type NameCache = std::sync::OnceLock<Mutex<std::collections::HashMap<u32, String>>>;
+static USER_NAMES: NameCache = std::sync::OnceLock::new();
+static GROUP_NAMES: NameCache = std::sync::OnceLock::new();
+
+fn cached_name(cache: &NameCache, id: u32, lookup: impl FnOnce() -> String) -> String {
+    let map = cache.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut map = map.lock().unwrap();
+    map.entry(id).or_insert_with(lookup).clone()
+}
+
+/// uid -> user name, resolved once per process (like tar). NSS lookups can cost
+/// ~1 ms each and musl re-reads /etc/passwd on every call.
+pub(crate) fn user_name(uid: u32) -> String {
+    cached_name(&USER_NAMES, uid, || {
+        users::get_user_by_uid(uid)
+            .map(|u| u.name().to_string_lossy().to_string())
+            .unwrap_or_else(|| uid.to_string())
+    })
+}
+
+/// gid -> group name, resolved once per process.
+pub(crate) fn group_name(gid: u32) -> String {
+    cached_name(&GROUP_NAMES, gid, || {
+        users::get_group_by_gid(gid)
+            .map(|g| g.name().to_string_lossy().to_string())
+            .unwrap_or_else(|| gid.to_string())
+    })
+}
+
 pub(crate) fn read_file_meta(path: &Path) -> io::Result<FileMeta> {
     let meta = fs::metadata(path)?;
     let mode = meta.permissions().mode();
@@ -1461,12 +1482,8 @@ pub(crate) fn read_file_meta(path: &Path) -> io::Result<FileMeta> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
-    let owner = users::get_user_by_uid(uid)
-        .map(|u| u.name().to_string_lossy().to_string())
-        .unwrap_or_else(|| uid.to_string());
-    let group = users::get_group_by_gid(gid)
-        .map(|g| g.name().to_string_lossy().to_string())
-        .unwrap_or_else(|| gid.to_string());
+    let owner = user_name(uid);
+    let group = group_name(gid);
     Ok(FileMeta { mode, uid, gid, owner, group, mtime })
 }
 

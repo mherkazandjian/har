@@ -52,6 +52,14 @@ pub(crate) struct StreamingBatch {
     pub(crate) total_bytes: usize,
 }
 
+/// Messages from the per-batch reader thread to the writer (sequential pack path).
+enum ReadMsg {
+    /// Next chunk of the current file, in file order.
+    Chunk(Vec<u8>),
+    /// The current file is fully read; the next message belongs to the next file.
+    EndOfFile,
+}
+
 pub(crate) struct IndexRecord {
     pub(crate) bagit_path: String,
     pub(crate) batch_id: u32,
@@ -243,12 +251,8 @@ pub(crate) fn read_and_hash(path: &Path, algo: &str) -> std::io::Result<HashResu
     let gid = meta.gid();
     let mtime = meta.modified()?.duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default().as_secs_f64();
-    let owner = users::get_user_by_uid(uid)
-        .map(|u| u.name().to_string_lossy().to_string())
-        .unwrap_or_else(|| uid.to_string());
-    let group = users::get_group_by_gid(gid)
-        .map(|g| g.name().to_string_lossy().to_string())
-        .unwrap_or_else(|| gid.to_string());
+    let owner = crate::user_name(uid);
+    let group = crate::group_name(gid);
     let hash = crate::compute_checksum(&content, algo);
     Ok(HashResult { content, mode, hash, uid, gid, mtime, owner, group })
 }
@@ -662,6 +666,27 @@ pub fn pack_bagit(
             let batch_name = batch.id.to_string();
             let batch_ds = builder.create(batch_name.as_str()).unwrap();
 
+            // One reader thread per batch (not per file): it streams every file of
+            // the batch in order as 1MiB chunks, so reads still overlap hashing and
+            // HDF5 writes, without paying a thread spawn per file.
+            let (chunk_tx, chunk_rx) = mpsc::sync_channel::<ReadMsg>(4);
+            let read_paths: Vec<std::path::PathBuf> =
+                batch.files.iter().map(|f| f.file_path.clone()).collect();
+            let reader = std::thread::spawn(move || {
+                let mut buf = vec![0u8; crate::READ_CHUNK];
+                for path in &read_paths {
+                    let mut file = fs::File::open(path).unwrap_or_else(|e| {
+                        panic!("Failed to open '{}' for reading: {}", path.display(), e)
+                    });
+                    loop {
+                        let n = file.read(&mut buf).expect("Failed to read file chunk");
+                        if n == 0 { break; }
+                        if chunk_tx.send(ReadMsg::Chunk(buf[..n].to_vec())).is_err() { return; }
+                    }
+                    if chunk_tx.send(ReadMsg::EndOfFile).is_err() { return; }
+                }
+            });
+
             for f in &batch.files {
                 let file_size = fs::metadata(&f.file_path).map(|m| m.len()).unwrap_or(0);
 
@@ -676,32 +701,22 @@ pub fn pack_bagit(
 
                 let file_meta = crate::read_file_meta(&f.file_path).expect("Failed to stat file");
 
-                // Spawn reader thread — reads file in 1MiB chunks
-                let (chunk_tx, chunk_rx) = mpsc::sync_channel::<Vec<u8>>(4);
-                let read_path = f.file_path.clone();
-                let reader = std::thread::spawn(move || {
-                    let mut file = fs::File::open(&read_path)
-                        .expect("Failed to open file for reading");
-                    let mut buf = vec![0u8; crate::READ_CHUNK];
-                    loop {
-                        let n = file.read(&mut buf).expect("Failed to read file chunk");
-                        if n == 0 { break; }
-                        if chunk_tx.send(buf[..n].to_vec()).is_err() { break; }
-                    }
-                });
-
-                // Main thread: write chunks into batch dataset at file's offset
+                // Main thread: write this file's chunks into the batch dataset at its offset
                 let file_base_offset = f.offset;
                 let mut write_offset: usize = 0;
                 let mut hasher = crate::StreamHasher::new(hash_algo);
-                for chunk in chunk_rx.iter() {
-                    let chunk_len = chunk.len();
-                    hasher.update(&chunk);
-                    crate::write_dataset_chunk(&batch_ds, &chunk, file_base_offset + write_offset);
-                    write_offset += chunk_len;
-                    progress.update_file_progress(write_offset as u64);
+                loop {
+                    match chunk_rx.recv() {
+                        Ok(ReadMsg::Chunk(chunk)) => {
+                            hasher.update(&chunk);
+                            crate::write_dataset_chunk(&batch_ds, &chunk, file_base_offset + write_offset);
+                            write_offset += chunk.len();
+                            progress.update_file_progress(write_offset as u64);
+                        }
+                        Ok(ReadMsg::EndOfFile) => break,
+                        Err(_) => panic!("Reader thread ended before '{}' was read", f.rel_path),
+                    }
                 }
-                reader.join().expect("Reader thread panicked");
 
                 let hash = hasher.finalize_hex();
                 let bagit_path = format!("data/{}", f.rel_path);
@@ -739,6 +754,7 @@ pub fn pack_bagit(
                     println!("  {}", f.rel_path);
                 }
             }
+            reader.join().expect("Reader thread panicked");
         } else {
             // --- Parallel or LZMA path: buffer entire batch then write ---
             let mut batch_buffer = vec![0u8; batch.total_bytes];
@@ -899,9 +915,14 @@ pub fn pack_bagit(
                 .expect("group exceeds 256 bytes or is not ASCII"),
         }
     }).collect();
-    h5f.new_dataset::<CompoundIndexEntryV2>()
-        .shape(compound_rows.len())
-        .create("index").unwrap()
+    // Each record is ~4.7 KB of mostly zero padding (S4096 path, S256 owner/group),
+    // so store the index chunked + deflated: halves the archive for small files.
+    let mut index_builder = h5f.new_dataset::<CompoundIndexEntryV2>()
+        .shape(compound_rows.len());
+    if !compound_rows.is_empty() {
+        index_builder = index_builder.chunk(compound_rows.len().min(1024)).deflate(1);
+    }
+    index_builder.create("index").unwrap()
         .write_raw(&compound_rows).unwrap();
 
     // BagIt tag files
