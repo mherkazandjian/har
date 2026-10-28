@@ -48,6 +48,9 @@ import json
 import h5py
 import numpy as np
 import time
+import functools
+import pwd
+import grp as grp_mod
 
 
 def _human_size(nbytes):
@@ -148,6 +151,24 @@ def compute_checksum(data, algo):
         raise ValueError(f"Unsupported checksum algorithm: {algo}")
 
 
+@functools.lru_cache(maxsize=None)
+def _user_name(uid):
+    """Resolve uid -> user name once per process (NSS lookups can cost ~1 ms each)."""
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+@functools.lru_cache(maxsize=None)
+def _group_name(gid):
+    """Resolve gid -> group name once per process."""
+    try:
+        return grp_mod.getgrgid(gid).gr_name
+    except KeyError:
+        return str(gid)
+
+
 def _read_file(file_path):
     """Read a file's bytes and permission mode. Unit of work for ThreadPoolExecutor."""
     with open(file_path, 'rb') as fobj:
@@ -157,15 +178,8 @@ def _read_file(file_path):
     uid = st.st_uid
     gid = st.st_gid
     mtime = st.st_mtime
-    import pwd, grp as grp_mod
-    try:
-        owner = pwd.getpwuid(uid).pw_name
-    except KeyError:
-        owner = str(uid)
-    try:
-        group = grp_mod.getgrgid(gid).gr_name
-    except KeyError:
-        group = str(gid)
+    owner = _user_name(uid)
+    group = _group_name(gid)
     return content, mode, uid, gid, owner, group, mtime
 
 

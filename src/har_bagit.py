@@ -18,6 +18,7 @@ import concurrent.futures
 import h5py
 import numpy as np
 
+from har import _user_name, _group_name
 
 
 class ProgressBar:
@@ -164,15 +165,8 @@ def _read_and_hash(file_path, algo='sha256'):
     uid = st.st_uid
     gid = st.st_gid
     mtime = st.st_mtime
-    import pwd, grp as grp_mod
-    try:
-        owner = pwd.getpwuid(uid).pw_name
-    except KeyError:
-        owner = str(uid)
-    try:
-        group_name = grp_mod.getgrgid(gid).gr_name
-    except KeyError:
-        group_name = str(gid)
+    owner = _user_name(uid)
+    group_name = _group_name(gid)
     hash_hex = compute_checksum(content, algo)
     return content, mode, hash_hex, uid, gid, mtime, owner, group_name
 
